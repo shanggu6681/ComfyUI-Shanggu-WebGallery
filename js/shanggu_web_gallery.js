@@ -15,7 +15,12 @@ const FULL = (p) => BASE + "/sg_gallery/" + p;
 const PRESET = "https://civitai.red/api/v1/images?limit=20";
 // 检索页现在是「一个作品一张封面」，每页 60 张，这个上限约等于 25 页。
 // 以前把同系列图片全部摊平，每页 200 张，两页就撞满 400 导致滚动停摆。
+// MAX_TILES 只是「自动滚动」的软上限：到点先暂停，避免后台越滚越卡；
+// 用户手动点「加载更多」即解除它，改为不限量继续加载，直到 SAFETY_TILES
+// 这个纯防浏览器卡死的兜底值（正常浏览根本到不了）。
 const MAX_TILES = 1500;
+const SAFETY_TILES = 20000;
+const SAVE_TILES = 3000;   // 写进 workflow 的条目上限，避免 JSON 过大
 
 /* 面板注册表：全局 Run 拦截器用它找到画布上处于「多图 + 多选」的图库节点 */
 const PANELS = new Map();
@@ -412,6 +417,7 @@ function buildPanel(node) {
     "提示：输入 https://aitag.win/ 或 https://civitai.red/images 会自动切到同站 JSON 接口；" +
     "aitag.win 的检索页每个作品只显示 1 张封面，点封面才在它后面紧挨着展开同系列图片，未点开的不显示；" +
     "网址下方的「18+」勾选框控制是否请求 aitag.win 的成人内容（默认开启）。" +
+    "滚动到 1500 格会自动暂停，此时点「加载更多」即可无视上限继续加载；重新搜索会恢复软上限。" +
     "运行次数只看「单图 / 多图」：单图一次只跑 1 张；多图按点选顺序，每张图各提交一次独立运行，" +
     "队列里会依次出现 N 个任务，属正常现象。运行提交成功后会自动清空已选图片，可直接点下一批。");
   adv.appendChild(advHint);
@@ -427,7 +433,7 @@ function buildPanel(node) {
 
   const state = {
     sid: (node.properties.sg_session || ("sg" + Math.random().toString(36).slice(2, 10))),
-    items: (node.properties.sg_items || []).slice(0, 600),
+    items: (node.properties.sg_items || []).slice(0, SAVE_TILES),
     childItems: [],      // 已点开的同系列图片（只显示在封面后面，不算检索页条目）
     selected: [],
     selectedByUrl: new Map(),
@@ -437,10 +443,13 @@ function buildPanel(node) {
     autoChained: 0,      // 滚动没被撑开时自动续拉的次数
     rewriteHint: "",
     truncated: false,
+    unlimited: false,    // 手动点过「加载更多」后解除软上限，本次搜索内一直有效
     override: null,      // 循环执行期间临时写入 prompt 的单张 JSON
     runTotal: 0,
     runDone: 0,
   };
+  // 用 Set 去重：解除上限后可能上万条，数组的 some() 会退化成 O(n²)
+  state.seenUrls = new Set(state.items.map((x) => x && x.url).filter(Boolean));
   node.properties.sg_session = state.sid;
 
   function collectSettings() {
@@ -472,7 +481,7 @@ function buildPanel(node) {
     const ww = w("selected_files");
     if (ww && state.override == null) ww.value = JSON.stringify(state.selected);
     node.properties.sg_selected = state.selected;
-    node.properties.sg_items = state.items.slice(0, 600);
+    node.properties.sg_items = state.items.slice(0, SAVE_TILES);
     node.setDirtyCanvas(true, true);
     updateStatus();
   }
@@ -505,12 +514,25 @@ function buildPanel(node) {
     const run = single
       ? "运行 1 次"
       : `每张各运行 1 次(共 ${Math.max(1, state.selected.length)} 次)`;
+    const capNote = state.truncated
+      ? (state.items.length >= SAFETY_TILES
+          ? ` · 已达浏览器安全上限 ${SAFETY_TILES} 张，重新搜索可重置`
+          : " · 已达自动滚动上限，点「加载更多」可无视上限继续")
+      : (state.unlimited ? " · 已解除上限(不限量)" : "");
     setStatus(
       `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张 · ${sm} · ${run}` +
       (state.childItems.length ? " · 已展开 " + state.childItems.length + " 张同系列" : "") +
       (state.hasMore ? " · 向下滚动继续加载" : "") +
-      (state.truncated ? " · 已达显示上限" : "") + state.rewriteHint
+      capNote + state.rewriteHint
     );
+    if (btnMore) {
+      btnMore.textContent = state.items.length >= SAFETY_TILES ? "已达安全上限"
+        : state.truncated ? "加载更多(解除上限)"
+        : (state.unlimited ? "加载更多(不限)" : "加载更多");
+      btnMore.title = state.truncated
+        ? "已到自动滚动的软上限，点这里解除上限并继续加载下一页"
+        : "手动加载下一页（无视 1500 格软上限）";
+    }
     syncModeButtons();
   }
 
@@ -587,10 +609,13 @@ function buildPanel(node) {
   }
 
   function appendItems(items, opts = {}) {
+    // 自动滚动守软上限；手动点「加载更多」(ignoreLimit) 或已解除上限时只看安全兜底
+    const cap = (opts.ignoreLimit || state.unlimited) ? SAFETY_TILES : MAX_TILES;
     for (const it of items) {
       if (!it || !it.url) continue;
-      if (!opts.fromRestore && state.items.some((x) => x.url === it.url)) continue;
-      if (state.items.length >= MAX_TILES) { state.truncated = true; break; }
+      if (!opts.fromRestore && state.seenUrls.has(it.url)) continue;
+      if (state.items.length >= cap) { state.truncated = true; break; }
+      state.seenUrls.add(it.url);
       state.items.push(it);
       grid.appendChild(makeTile(it));
     }
@@ -633,8 +658,9 @@ function buildPanel(node) {
     const rest = children.filter((c) => c && c.url && c.url !== it.url);
     if (rest.length) {
       const anchor = tile.nextSibling;   // 一直插到同一个锚点前 => 顺序与作品页一致
+      const childCap = state.unlimited ? SAFETY_TILES : MAX_TILES + 600;
       for (const c of rest) {
-        if (grid.children.length >= MAX_TILES + 600) break;
+        if (grid.children.length >= childCap) break;
         grid.insertBefore(makeTile(c, { child: true, groupId: gid }), anchor);
         state.childItems.push(c);
       }
@@ -709,19 +735,32 @@ function buildPanel(node) {
     return grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 160;
   }
 
-  async function doFetch(reset) {
+  async function doFetch(reset, opts = {}) {
+    const ignoreLimit = !!opts.ignoreLimit;
     if (state.loading) return;
-    if (!reset && (!state.hasMore || state.truncated)) return;
+    // 手动点「加载更多」时，即便软上限把 hasMore 置成 false 也照样继续拉一页
+    if (!reset && !ignoreLimit && (!state.hasMore || state.truncated)) return;
+    if (ignoreLimit && state.items.length >= SAFETY_TILES) {
+      setStatus(`已达浏览器安全上限 ${SAFETY_TILES} 张，请重新搜索`, true);
+      return;
+    }
+    if (ignoreLimit) {
+      state.unlimited = true;     // 用户明确要继续，本次搜索内不再受 1500 格约束
+      state.truncated = false;
+      state.hasMore = true;       // 之前可能正好因为撞上限被置 false
+    }
     state.loading = true;
     btnMore.disabled = true;
     if (reset) {
       grid.innerHTML = "";
       state.items = [];
       state.childItems = [];
+      state.seenUrls.clear();
       state.hasMore = true;
       state.page = 0;
       state.autoChained = 0;
       state.truncated = false;
+      state.unlimited = false;    // 重新搜索恢复默认的软上限
     }
     setStatus("正在抓取网页…");
     try {
@@ -732,11 +771,14 @@ function buildPanel(node) {
         settings: collectSettings(),
       });
       if (!r.ok) {
-        setStatus(r.error || "抓取失败", true);
+        // 后端分页游标只存在内存里，ComfyUI 重启后会丢；点「加载更多」时给个明确指引
+        const stale = !reset && /请先填写网址/.test(r.error || "");
+        setStatus(stale ? "后端分页会话已失效（通常是 ComfyUI 重启过），请重新点「搜索」"
+                        : (r.error || "抓取失败"), true);
         state.hasMore = false;
       } else {
         state.rewriteHint = r.rewritten ? " · 已自动改用该站的 JSON 接口" : "";
-        appendItems(r.items || []);
+        appendItems(r.items || [], { ignoreLimit });
         state.hasMore = !!r.has_more && !state.truncated;
         state.page = r.page || 0;
         if (r.message && !(r.items || []).length) setStatus(r.message, false);
@@ -751,7 +793,8 @@ function buildPanel(node) {
     }
     // 这一页没能撑长滚动条时，浏览器不会再发 scroll 事件，无限滚动就
     // 卡死在底部了（整页被去重 / 接口偶发空页都会这样）。主动再拉几页。
-    if (!reset && state.hasMore && !state.truncated && nearGridBottom()) {
+    // 手动点「加载更多」= 只加一页；自动续拉只服务滚动，别一口气再拖 12 页
+    if (!reset && !ignoreLimit && state.hasMore && !state.truncated && nearGridBottom()) {
       state.autoChained += 1;
       if (state.autoChained <= 12) setTimeout(() => doFetch(false), 80);
     } else {
@@ -773,7 +816,8 @@ function buildPanel(node) {
       });
       if (!r.ok) { setStatus(r.error || "解析失败", true); return; }
       if (!appendChk.checked) {
-        grid.innerHTML = ""; state.items = []; state.childItems = []; state.truncated = false;
+        grid.innerHTML = ""; state.items = []; state.childItems = [];
+        state.seenUrls.clear(); state.truncated = false;
       }
       appendItems(r.items || []);
       state.hasMore = false;
@@ -804,7 +848,8 @@ function buildPanel(node) {
     rememberUrl(u);
     doFetch(true);
   };
-  btnMore.onclick = () => doFetch(false);
+  // 手动点「加载更多」永远无视 1500 格软上限，哪怕状态栏已经提示到顶
+  btnMore.onclick = () => doFetch(false, { ignoreLimit: true });
   btnParse.onclick = doParse;
   btnCopyBM.onclick = async () => {
     try {
@@ -845,7 +890,7 @@ function buildPanel(node) {
     // 「全选可见」隐含多选意图，自动切到多图模式
     if (selectMode() === SEL_SINGLE) setSelectMode(SEL_MULTI);
     for (const it of state.items.concat(state.childItems)) {
-      if (grid.children.length >= MAX_TILES && state.truncated) break;
+      if (state.selected.length >= SAFETY_TILES) break;   // 只防极端情况，不再按软上限截断
       if (!state.selectedByUrl.has(it.url)) await toggleSelect(it);
     }
   };
@@ -889,11 +934,14 @@ function buildPanel(node) {
     }
     // 从工作流恢复时先清空 items，否则 appendItems 的去重会把它们全跳过，
     // 网格会变成空白；封面只存 group_id，点开时由 /expand 现场取回同系列。
-    const savedItems = (node.properties.sg_items || []).slice(0, 600);
+    const savedItems = (node.properties.sg_items || []).slice(0, SAVE_TILES);
     state.items = [];
     state.childItems = [];
+    state.seenUrls.clear();
     grid.innerHTML = "";
-    appendItems(savedItems, { fromRestore: true });
+    // 存了 3000 张就全部还原，别再被 1500 软上限砍掉一半
+    state.unlimited = savedItems.length > MAX_TILES;
+    appendItems(savedItems, { fromRestore: true, ignoreLimit: state.unlimited });
     syncModeButtons();
     updateStatus();
   }
