@@ -2,8 +2,8 @@
 """ComfyUI-Shanggu-WebGallery —— 网页图库选图器。
 
 在 ComfyUI 节点里输入任意网页 / JSON API 地址 -> 滚动浏览缩略图 ->
-点选（可多选） -> 等价于「加载图像」输出 IMAGE/MASK -> 接图生图工作流。
-多图时可选「批量一次执行」或「逐张完整执行」。
+点选 -> 等价于「加载图像」输出 IMAGE/MASK -> 接图生图工作流。
+单图运行 1 次；多图按点选顺序，每张图各完整运行 1 次工作流。
 """
 import os
 import sys

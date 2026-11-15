@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """节点本体：把图库里点选的图片变成 ComfyUI 的 IMAGE / MASK 张量。
 
-- 单张时行为与内置 LoadImage 完全一致，可以直接替换「加载图像」节点；
-- 「单图」选择模式：点任意图片自动替换当前选中，永远只加载一张；
-- 「多图」选择模式：可累加选中多张；
-- 多图 + 「逐张完整执行」：前端把一次 Run 串行拆成 N 个独立 prompt，
-  每个 prompt 只带一张图，整个下游工作流真正跑 N 遍（推荐）；
-- 多图 + 「批量一次执行」：输出 IMAGE 批次 [N,H,W,C]，工作流只跑 1 次，
-  要求下游节点支持 batch，且显存要够（等价于文件夹批量导入型工作流）。
+本节点永远等价于「一个 LoadImage」：一次 prompt 只加载一张图。
+执行次数完全由「单图 / 多图」这一个开关决定：
+
+- 单图：点任意图片自动替换当前选中；点运行 → 这一张图跑 1 次工作流。
+- 多图：可累加选中 N 张；前端把一次 Run 串行拆成 N 个独立 prompt，
+  每个 prompt 只带一张图，整个下游工作流真正跑 N 遍。
+
+不再提供「批量一次执行」：把 N 张塞进一个 IMAGE 批次里既要求下游全部支持
+batch，又容易撑爆显存，和「每个图片执行一遍工作流」这个目标自相矛盾。
+
+`multi_mode` 只是旧版工作流留下的隐藏占位参数，值被完全忽略；保留它是
+为了让老工作流的 widgets_values 顺序不错位（删掉会让后面的 widget 值错位）。
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 
+# 兼容旧工作流的隐藏占位值，不参与任何逻辑判断
 MODE_BATCH = "批量一次执行"
 MODE_QUEUE = "逐张完整执行"
 SEL_SINGLE = "单图(点选替换)"
@@ -105,7 +111,7 @@ def _one_image(path: str):
 
 
 class ShangguWebImageGallery:
-    """网页图库选图器（可替代 LoadImage，支持多图批量 / 逐张执行）。"""
+    """网页图库选图器（可替代 LoadImage；单图跑 1 次，多图每图各跑 1 次）。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -119,9 +125,10 @@ class ShangguWebImageGallery:
                     "default": "[]", "multiline": True,
                     "tooltip": "由节点面板点选图片时自动写入，一般不用手改",
                 }),
+                # 已弃用：仅为兼容老工作流的隐藏占位参数，前端会隐藏它
                 "multi_mode": ([MODE_QUEUE, MODE_BATCH], {
                     "default": MODE_QUEUE,
-                    "tooltip": "逐张=每个选中图完整跑一遍工作流(推荐)；批量=一次执行输出N张的IMAGE批次",
+                    "tooltip": "已弃用（兼容旧工作流用）：运行次数现在完全由「单图/多图」决定",
                 }),
                 "size_mode": (SIZE_MODES, {"default": SIZE_MODES[0]}),
                 "target_width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 64}),
@@ -131,7 +138,7 @@ class ShangguWebImageGallery:
             "optional": {
                 "select_mode": (SELECT_MODES, {
                     "default": SEL_SINGLE,
-                    "tooltip": "单图=点哪个换哪个；多图=可累加多选，逐张模式下每图跑一次工作流",
+                    "tooltip": "单图=点哪个换哪个，运行 1 次；多图=可累加多选，每张图各完整运行 1 次工作流",
                 }),
             },
         }
@@ -140,18 +147,29 @@ class ShangguWebImageGallery:
     RETURN_NAMES = ("images", "masks", "count", "info_json")
     FUNCTION = "load_gallery"
     CATEGORY = "image/Shanggu 网页图库"
-    DESCRIPTION = "浏览网页图片、点选加载，等价于 LoadImage；单图/多图开关，多图可让下游工作流逐张执行 N 次。"
+    DESCRIPTION = "浏览网页图片、点选加载，等价于 LoadImage；单图运行 1 次，多图按选中顺序每图各运行 1 次。"
 
     def load_gallery(self, site_url, selected_files, multi_mode, size_mode,
                      target_width, target_height, select_mode=SEL_SINGLE):
-        # select_mode 只控制前端「点哪个换哪个」的交互；真正加载几张完全由
-        # selected_files 决定。这里不做截断，避免老工作流缺少该可选参数时
-        # 把多图批次误裁成一张。
+        # multi_mode 已弃用，值完全忽略。执行次数由前端按 select_mode 拆成
+        # N 个独立 prompt，因此正常情况下每个 prompt 里只会有一张图。
         entries = _entries(selected_files)
         if not entries:
             raise ValueError(
                 "[Shanggu 网页图库] 还没有点选任何图片：请先在节点面板里搜索网址，"
                 "然后点击缩略图选中（可多选），再运行工作流。"
+            )
+        if select_mode == SEL_SINGLE:
+            # 单图语义：无论旧工作流里残留了几张，只用当前这一张
+            entries = entries[:1]
+        elif len(entries) > 1:
+            # 多图本该被前端拆成 N 次运行；走到这里说明扇出没生效，
+            # 明确报错，避免又退化成「一个 prompt 塞 N 张」而卡住/爆显存。
+            raise ValueError(
+                f"[Shanggu 网页图库] 多图模式收到了 {len(entries)} 张图，但每次运行只允许一张。\n"
+                "多图由前端自动拆成 N 次独立运行，请确认扩展 JS 已加载：浏览器 Ctrl+F5 强制刷新，"
+                "然后用节点面板的「▶ 运行(N 次)」或 ComfyUI 原生运行按钮执行。\n"
+                "另外，一个工作流里请只放一个处于「多图」模式的选图器节点。"
             )
 
         loaded = []
@@ -173,8 +191,8 @@ class ShangguWebImageGallery:
         if keep_original:
             if len(sizes) > 1:
                 raise ValueError(
-                    f"[Shanggu 网页图库] 选中的图片尺寸不一致 {sorted(sizes)}，"
-                    "IMAGE 批次要求同宽高。请把 size_mode 改成「等比缩放+填充」等统一尺寸方式。"
+                    f"[Shanggu 网页图库] 图片尺寸不一致 {sorted(sizes)}，"
+                    "IMAGE 张量要求同宽高。请把 size_mode 改成「等比缩放+填充」等统一尺寸方式。"
                 )
             tw, th = next(iter(sizes))
         else:

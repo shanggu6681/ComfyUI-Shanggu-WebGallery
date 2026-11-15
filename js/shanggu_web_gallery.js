@@ -1,12 +1,11 @@
 // ComfyUI-Shanggu-WebGallery — 前端扩展
 // 面板：网址抓取 / 粘贴源码 / 浏览器桥接；滚动加载；点选即等价于 LoadImage。
-// 单图/多图开关；多图「逐张完整执行」= 一次 Run 串行提交 N 个独立 prompt。
+// 运行次数只由「单图 / 多图」一个开关决定：
+//   单图 → 1 张图，运行 1 次；多图 → 每张图各提交 1 个独立 prompt，运行 N 次。
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_TYPE = "ShangguWebImageGallery";
-const MODE_QUEUE = "逐张完整执行";
-const MODE_BATCH = "批量一次执行";
 const SEL_SINGLE = "单图(点选替换)";
 const SEL_MULTI = "多图(累加)";
 const BASE = api.api_base || "";
@@ -16,7 +15,7 @@ const FULL = (p) => BASE + "/sg_gallery/" + p;
 const PRESET = "https://civitai.red/api/v1/images?limit=20";
 const MAX_TILES = 400;   // 无限滚动的 DOM 上限，防止几百张缩略图把前端拖垮
 
-/* 面板注册表：全局 Run 拦截器用它找到画布上处于「逐张执行 + 多选」的图库节点 */
+/* 面板注册表：全局 Run 拦截器用它找到画布上处于「多图 + 多选」的图库节点 */
 const PANELS = new Map();
 
 /* ------------------------------------------------------------------ 样式 */
@@ -161,11 +160,14 @@ const BOOKMARKLET = "javascript:(" + sgBridgeBookmarklet.toString() + ")()";
  * ComfyUI 单次 prompt 是一张静态 DAG，节点本身没法「回头」重跑下游。
  * 真正跑 N 遍的唯一稳妥办法是提交 N 个独立 prompt。
  *
- * 旧做法是拦截 api.queuePrompt 一次塞 N 个 —— 那样 app.queuePrompt 只记录
- * 最后一个 job，前端进度/队列状态机对不上，看起来就像「卡住」。
- * 现在改为拦截 app.queuePrompt：每轮临时把 selected_files 改成单张，再串行
- * 调用原始 queuePrompt(…, 1, …)。每一轮都是完整的一次提交（graphToPrompt、
- * beforeQueued、job 记录、processingQueue 复位全部走原生流程），所以不会卡。
+ * 触发条件只看「单图 / 多图」：单图天然就是 1 次，不拦截；多图且选中
+ * 2 张以上才扇出。以前还有一个「逐张 / 批量」开关，那是重复且自相矛盾的
+ * ——「批量一次」把 N 张塞进一个 IMAGE 批次里，工作流其实只跑 1 次。
+ *
+ * 拦截点在 app.queuePrompt（不是 api.queuePrompt）：每轮临时把
+ * selected_files 改成单张，再串行调用原始 queuePrompt(…, 1, …)。
+ * 每一轮都是完整的一次提交（graphToPrompt、beforeQueued、job 记录、
+ * processingQueue 复位全部走原生流程），所以不会卡在进度状态机里。
  */
 let fanoutBusy = false;
 
@@ -176,7 +178,8 @@ function findLoopTarget() {
   for (const p of PANELS.values()) {
     if (!p) continue;
     if (alive && !alive.includes(p.node)) continue;
-    if (p.getMode() === MODE_QUEUE && p.getState().selected.length > 1) return p;
+    // 单图 = 1 次运行（不拦截）；多图 + 2 张以上才拆成 N 次
+    if (p.getSelectMode() === SEL_MULTI && p.getState().selected.length > 1) return p;
   }
   return null;
 }
@@ -184,7 +187,7 @@ function findLoopTarget() {
 function installRunLoop() {
   if (app.__sgGalleryRunLoop) return;
   if (typeof app.queuePrompt !== "function") {
-    console.warn("[ShangguWebGallery] app.queuePrompt 不可用，逐张执行按钮仍可用");
+    console.warn("[ShangguWebGallery] app.queuePrompt 不可用，多图逐张执行不可用；请用单图模式或检查前端版本");
     return;
   }
   app.__sgGalleryRunLoop = true;
@@ -295,16 +298,13 @@ function buildPanel(node) {
 
   root.append(paneUrl, panePaste, paneBridge);
 
-  /* --- 选择模式 / 执行模式 开关 --- */
+  /* --- 唯一的开关：单图 / 多图，同时决定运行次数 --- */
   const modeBar = el("div", "sg-modes");
   modeBar.appendChild(el("span", "", "选图"));
   const btnSingle = el("button", "", "单图");
   const btnMulti = el("button", "", "多图");
   modeBar.append(btnSingle, btnMulti);
-  modeBar.appendChild(el("span", "", "执行"));
-  const btnQueueMode = el("button", "", "逐张 N 次");
-  const btnBatchMode = el("button", "", "批量 1 次");
-  modeBar.append(btnQueueMode, btnBatchMode);
+  modeBar.appendChild(el("span", "", "单图=运行 1 次 · 多图=每张各跑 1 次"));
   root.appendChild(modeBar);
 
   const status = el("div", "sg-status", "就绪：填写网址后点「搜索」");
@@ -351,8 +351,9 @@ function buildPanel(node) {
   });
   adv.appendChild(advGrid);
   const advHint = el("div", "sg-hint",
-    "提示：输入 https://civitai.red/images 会自动切到同站 JSON 接口（网页版有 Cloudflare）；" +
-    "「逐张 N 次」= 每张图完整跑一遍工作流（推荐），「批量 1 次」= 输出 IMAGE 批次，只跑一次且要求下游支持 batch。");
+    "提示：输入 https://civitai.red/images 会自动切到同站 JSON 接口（网页版有 Cloudflare）。" +
+    "运行次数只看「单图 / 多图」：单图一次只跑 1 张；多图按点选顺序，每张图各提交一次独立运行，" +
+    "队列里会依次出现 N 个任务，属正常现象。");
   adv.appendChild(advHint);
   root.appendChild(adv);
 
@@ -416,36 +417,31 @@ function buildPanel(node) {
     return (sm && sm.value) || node.properties.sg_select_mode || SEL_SINGLE;
   }
 
-  function execMode() {
-    const mm = w("multi_mode");
-    return (mm && mm.value) || MODE_QUEUE;
-  }
-
   function syncModeButtons() {
-    const s = selectMode();
-    const e = execMode();
-    btnSingle.classList.toggle("sg-on", s === SEL_SINGLE);
-    btnMulti.classList.toggle("sg-on", s === SEL_MULTI);
-    btnQueueMode.classList.toggle("sg-on", e === MODE_QUEUE);
-    btnBatchMode.classList.toggle("sg-on", e === MODE_BATCH);
+    const single = selectMode() === SEL_SINGLE;
+    btnSingle.classList.toggle("sg-on", single);
+    btnMulti.classList.toggle("sg-on", !single);
     const n = Math.max(1, state.selected.length);
-    btnRun.textContent = e === MODE_BATCH ? "▶ 运行(批量 1 次)" : "▶ 运行(" + n + " 次)";
-    btnRun.title = e === MODE_BATCH
-      ? "一次执行，输出 IMAGE 批次（要求下游节点支持 batch）"
-      : "每张选中图各提交一个独立 prompt，完整工作流跑 N 次";
+    btnRun.textContent = single ? "▶ 运行(1 次)" : "▶ 运行(" + n + " 次)";
+    btnRun.title = single
+      ? "把当前选中的这一张图当作 LoadImage，完整工作流运行 1 次"
+      : "按点选顺序，每张图各提交 1 个独立 prompt，完整工作流运行 N 次";
   }
 
   function updateStatus() {
     if (state.runTotal > 0) {
-      setStatus(`循环执行中 ${state.runDone}/${state.runTotal} · 每张图各跑一次完整工作流`, false, true);
+      setStatus(`多图执行中 ${state.runDone}/${state.runTotal} · 每张图各跑一次完整工作流`, false, true);
+      // 进度状态期间也要刷新按钮，否则此时切换单/多图会让运行次数文案过期
+      syncModeButtons();
       return;
     }
-    const sm = selectMode() === SEL_SINGLE ? "单图(点哪个换哪个)" : "多图(可累加)";
-    const em = execMode() === MODE_QUEUE
-      ? `逐张执行(跑 ${Math.max(1, state.selected.length)} 次)`
-      : "批量一次执行";
+    const single = selectMode() === SEL_SINGLE;
+    const sm = single ? "单图(点哪个换哪个)" : "多图(可累加)";
+    const run = single
+      ? "运行 1 次"
+      : `每张各运行 1 次(共 ${Math.max(1, state.selected.length)} 次)`;
     setStatus(
-      `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张 · ${sm} · ${em}` +
+      `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张 · ${sm} · ${run}` +
       (state.hasMore ? " · 向下滚动继续加载" : "") +
       (state.truncated ? " · 已达显示上限" : "") + state.rewriteHint
     );
@@ -648,20 +644,13 @@ function buildPanel(node) {
     }
     updateStatus();
   }
-  function setExecMode(v) {
-    const mm = w("multi_mode");
-    if (mm) mm.value = v;
-    updateStatus();
-  }
   btnSingle.onclick = () => setSelectMode(SEL_SINGLE);
   btnMulti.onclick = () => setSelectMode(SEL_MULTI);
-  btnQueueMode.onclick = () => setExecMode(MODE_QUEUE);
-  btnBatchMode.onclick = () => setExecMode(MODE_BATCH);
 
-  /* --- 运行按钮：与 ComfyUI 的 Run 走同一条链路，自动扇出 --- */
+  /* --- 运行按钮：与 ComfyUI 的 Run 走同一条链路，多图时自动扇出 --- */
   btnRun.onclick = async () => {
     if (!state.selected.length) { setStatus("请先点选至少一张图片", true); return; }
-    if (state.runTotal > 0) { setStatus("循环执行进行中，请等待本轮结束", true); return; }
+    if (state.runTotal > 0) { setStatus("本轮执行尚未结束，请稍候", true); return; }
     try {
       await app.queuePrompt(0, 1, {});
     } catch (e) {
@@ -699,6 +688,15 @@ function buildPanel(node) {
       const sm = w("select_mode");
       if (sm) sm.value = node.properties.sg_select_mode;
     }
+    // 单图模式下旧工作流可能残留多张选中图，恢复时收敛到 1 张
+    if (selectMode() === SEL_SINGLE && state.selected.length > 1) {
+      state.selected = state.selected.slice(0, 1);
+      state.selectedByUrl = new Map(
+        state.selected.filter((x) => x.url).map((x) => [x.url, x])
+      );
+      const sw0 = w("selected_files");
+      if (sw0) sw0.value = JSON.stringify(state.selected);
+    }
     state.items = (node.properties.sg_items || []).slice(0, 600);
     grid.innerHTML = "";
     appendItems(state.items);
@@ -714,7 +712,9 @@ function buildPanel(node) {
   };
 
   // 隐藏只给程序用的 widget（值仍会随工作流保存并进入 prompt）
-  ["selected_files", "site_url"].forEach((name) => {
+  // multi_mode 是旧版「逐张 / 批量」留下的占位参数，值已完全不被读取，
+  // 保留它只为了让老工作流的 widgets_values 顺序不错位。
+  ["selected_files", "site_url", "multi_mode"].forEach((name) => {
     const ww = w(name);
     if (ww) ww.hidden = true;
   });
@@ -734,14 +734,6 @@ function buildPanel(node) {
       setSelectMode(selModeWidget.value);
     };
   }
-  const modeWidget = w("multi_mode");
-  if (modeWidget) {
-    const origCb = modeWidget.callback;
-    modeWidget.callback = function () {
-      if (origCb) origCb.apply(this, arguments);
-      updateStatus();
-    };
-  }
 
   /* 供全局 Run 拦截器使用的接口 */
   const panelApi = {
@@ -749,7 +741,7 @@ function buildPanel(node) {
     grid,                 // 容器尺寸变化时可手动校准
     syncRowHeight,
     getState: () => state,
-    getMode: execMode,
+    getSelectMode: selectMode,
     setOverride(v) {
       state.override = v;
       const sw = w("selected_files");
@@ -759,7 +751,7 @@ function buildPanel(node) {
       state.runDone = done;
       state.runTotal = total;
       if (total > 0) {
-        setStatus(`循环执行中 ${done}/${total} · 每张图各跑一次完整工作流`, false, true);
+        setStatus(`多图执行中 ${done}/${total} · 每张图各跑一次完整工作流`, false, true);
       } else {
         updateStatus();
       }
