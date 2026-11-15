@@ -28,6 +28,14 @@ DEFAULT_UA = (
 )
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".jxl", ".tif", ".tiff")
+
+# 防盗链：这些 CDN 只认来源站的 Referer，用图片域名自己当 Referer 会 403。
+# (域名后缀, 应该带的 Referer)，子域名自动匹配。
+REFERER_RULES = (
+    ("pximg.net", "https://www.pixiv.net/"),
+    ("ai-img.10118899.xyz", "https://aitag.win/"),
+)
+
 BAD_TOKENS = (
     "logo", "icon", "avatar", "sprite", "placeholder", "favicon", "badge",
     "emoji", "spinner", "loading", "1x1", "pixel.gif", "blank.gif", "gravatar",
@@ -71,6 +79,32 @@ def normalize_url(u: str, base: str = "") -> str:
         except Exception:
             return ""
     return u if re.match(r"^https?://", u, re.I) else ""
+
+
+def referer_for(url: str) -> str:
+    """按目标域名给出合适的 Referer，未命中规则时退回该 URL 自身的 origin。"""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return ""
+    host = (p.netloc or "").lower().split(":")[0]
+    for suffix, ref in REFERER_RULES:
+        if host == suffix or host.endswith("." + suffix):
+            return ref
+    return f"{p.scheme}://{p.netloc}/" if p.netloc else ""
+
+
+def bump_query_param(url: str, key: str, value: Any) -> str:
+    """把 URL query 里某个参数改成新值（不存在则追加）。"""
+    try:
+        p = urllib.parse.urlsplit(url)
+        pairs = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+                 if k.lower() != key.lower()]
+        pairs.append((key, str(value)))
+        return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path,
+                                       urllib.parse.urlencode(pairs), p.fragment))
+    except Exception:
+        return ""
 
 
 def canonical_url(u: str) -> str:
@@ -161,6 +195,8 @@ def _make_item(primary: str, thumb: str | None, obj: dict, base: str) -> dict:
         "height": obj.get("height") if isinstance(obj.get("height"), int) else None,
         "nsfw": _is_nsfw(obj),
         "id": str(obj.get("id") or obj.get("postId") or ""),
+        # 站点适配器可以指定下载这张图时要带的 Referer（防盗链 CDN）
+        "referer": str(obj.get("referer") or ""),
     }
 
 
@@ -275,6 +311,19 @@ def next_page_url(data: Any, base: str, current: str, page_template: str, page: 
         )
     if tpl and ("{page}" in tpl or "{offset}" in tpl):
         return render_page_template(tpl, base or current, page)
+    # 常见的 {page, page_size, total, items} 分页结构，接口不给 nextPage 时
+    # 也能靠 page+1 继续滚动（aitag.win / 大量 REST 图库都是这个形状）。
+    if isinstance(data, dict) and isinstance(data.get("items"), list) and data["items"]:
+        try:
+            pg, ps, total = (int(data.get("page") or 0),
+                             int(data.get("page_size") or 0),
+                             int(data.get("total") or 0))
+        except (TypeError, ValueError):
+            pg = ps = total = 0
+        if pg > 0 and ps > 0 and total > pg * ps:
+            bumped = bump_query_param(current or base, "page", pg + 1)
+            if bumped:
+                return bumped
     return None
 
 
@@ -459,8 +508,8 @@ def build_headers(settings: dict, url: str = "", json_mode: bool = False) -> dic
     }
     referer = (settings.get("referer") or "").strip()
     if not referer and url:
-        p = urllib.parse.urlsplit(url)
-        referer = f"{p.scheme}://{p.netloc}/"
+        # 显式 Referer 优先；否则按防盗链规则推导，再退回 URL 自身 origin。
+        referer = referer_for(url)
     if referer:
         headers["Referer"] = referer
     cookie = (settings.get("cookie") or "").strip()

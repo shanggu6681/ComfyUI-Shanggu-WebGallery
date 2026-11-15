@@ -568,7 +568,7 @@ function buildPanel(node) {
         setStatus(r.error || "抓取失败", true);
         state.hasMore = false;
       } else {
-        state.rewriteHint = r.rewritten ? " · 网页被拦截，已自动改用 JSON 接口" : "";
+        state.rewriteHint = r.rewritten ? " · 已自动改用该站的 JSON 接口" : "";
         appendItems(r.items || []);
         state.hasMore = !!r.has_more && !state.truncated;
         state.page = r.page || 0;

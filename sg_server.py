@@ -16,6 +16,7 @@ from typing import Any
 from aiohttp import web
 
 import sg_scraper as sg
+import sg_adapters as adapters
 
 SESSIONS: dict[str, dict] = {}
 MAX_SESSIONS = 64
@@ -80,6 +81,10 @@ def rewrite_gallery_url(url: str) -> tuple[str, bool]:
             return f"https://{p.netloc}/api/v1/images?limit=20", True
     except Exception:
         pass
+    # SPA 图库（HTML 里没有图片，全靠 JS 调自家 JSON 接口）
+    extra, hit = adapters.rewrite_extra(url)
+    if hit:
+        return extra, True
     return url, False
 
 
@@ -89,6 +94,24 @@ def _render_template(tpl: str, base: str, page: int) -> str:
     )
     if out and not out.lower().startswith(("http://", "https://")):
         out = urllib.parse.urljoin(base, out)
+    return out
+
+
+def _settings_for(url: str, base: dict, sid: str = "") -> dict:
+    """下载/出缩略图时补上防盗链 Referer。
+
+    优先用用户在高级设置里显式填的；其次用抓取时该图片自带的 referer
+    （SPA 适配器会记录）；最后按域名规则推导。
+    """
+    out = dict(base or {})
+    if str(out.get("referer") or "").strip():
+        return out
+    sess = SESSIONS.get(sid or "default") or {}
+    for it in sess.get("items", []):
+        if it.get("url") == url and str(it.get("referer") or "").strip():
+            out["referer"] = it["referer"]
+            return out
+    out["referer"] = sg.referer_for(url)
     return out
 
 
@@ -147,15 +170,19 @@ async def handle_fetch(request: web.Request) -> web.Response:
 
     text = body.decode("utf-8", errors="replace")
     try:
-        items, nxt, kind = sg.extract(
-            text, ctype, final,
-            url_regex=settings.get("url_regex", ""),
-            safe_only=settings["safe_only"],
-            page_template=settings.get("page_template", ""),
-            page=next_page_no,
-            current_url=final,
-            limit=settings["per_page"],
-        )
+        adapted = await adapters.parse(final, text, settings, settings["per_page"])
+        if adapted is not None:
+            items, nxt, kind = adapted
+        else:
+            items, nxt, kind = sg.extract(
+                text, ctype, final,
+                url_regex=settings.get("url_regex", ""),
+                safe_only=settings["safe_only"],
+                page_template=settings.get("page_template", ""),
+                page=next_page_no,
+                current_url=final,
+                limit=settings["per_page"],
+            )
     except Exception as e:
         return _error(f"解析失败: {e}")
 
@@ -235,7 +262,8 @@ async def handle_thumb(request: web.Request) -> web.Response:
         w = max(64, min(1024, int(request.query.get("w", 320))))
     except Exception:
         w = 320
-    settings = get_session(request.query.get("session_id", "default")).get("settings", {})
+    sid = request.query.get("session_id", "default")
+    settings = _settings_for(url, get_session(sid).get("settings", {}), sid)
     key = hashlib.sha1((url + "|" + str(w)).encode("utf-8")).hexdigest() + ".jpg"
     path = os.path.join(CACHE_DIR, key)
     if os.path.isfile(path):
@@ -276,9 +304,10 @@ async def handle_select(request: web.Request) -> web.Response:
     url = str(d.get("url") or "").strip()
     if not url:
         return _error("缺少图片地址")
-    settings = _clean_settings(d.get("settings")) or get_session(
-        str(d.get("session_id") or "default")
-    ).get("settings", {})
+    sid = str(d.get("session_id") or "default")
+    settings = _settings_for(
+        url, _clean_settings(d.get("settings")) or get_session(sid).get("settings", {}), sid
+    )
 
     try:
         import folder_paths
