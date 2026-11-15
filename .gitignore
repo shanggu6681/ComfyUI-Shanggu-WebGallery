@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行期缓存：第三方站点缩略图 / 下载的原图，不随仓库分发
+.cache/
+input/
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 本地凭据（切勿提交）
+_gh_token.txt
+*.token
+.env
