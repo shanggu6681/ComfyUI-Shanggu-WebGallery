@@ -33,8 +33,12 @@ _ASSET_CACHE: dict[str, Any] = {"url": "", "ts": 0.0}
 # --------------------------------------------------------------------------- #
 # 网址改写（由 sg_server.rewrite_gallery_url 调用）
 # --------------------------------------------------------------------------- #
-def rewrite_extra(url: str) -> tuple[str, bool]:
-    """把图库网页地址改写成同站的 JSON 接口。已经填了接口地址就原样返回。"""
+def rewrite_extra(url: str, r18: bool = False) -> tuple[str, bool]:
+    """把图库网页地址改写成同站的 JSON 接口。
+
+    r18=True 时请求该站的 18+ 作品集（show_r18=1）；该参数同时作用于
+    用户自己粘贴的 /api/ai_works_search 地址，保证面板开关始终有效。
+    """
     try:
         p = urllib.parse.urlsplit(url)
         host = (p.netloc or "").lower().split(":")[0]
@@ -44,7 +48,12 @@ def rewrite_extra(url: str) -> tuple[str, bool]:
 
     if host not in AITAG_HOSTS:
         return url, False
+    show = "1" if r18 else "0"
     if path.startswith("/api/"):
+        if "ai_works_search" in path:
+            # 已经是接口地址了，只把 18+ 参数同步成面板开关的值
+            fixed = sg.bump_query_param(url, "show_r18", show)
+            return fixed or url, False
         return url, False
 
     origin = f"{p.scheme or 'https'}://{p.netloc}"
@@ -60,7 +69,7 @@ def rewrite_extra(url: str) -> tuple[str, bool]:
         "page_size": q.get("page_size") or "60",  # 该接口要求 >= 60
         "sort": q.get("sort") or "new",
         "time_range": q.get("time_range") or "all",
-        "show_r18": q.get("show_r18") or "0",
+        "show_r18": show,
     }
     # 用户在网址里带的搜索词要保留下来
     for k in ("q", "prompt", "tag", "tags", "sensitive_policy"):

@@ -43,6 +43,9 @@ const CSS = `
 .sg-root textarea{width:100%;height:64px;resize:vertical;font-size:11px}
 .sg-quick{display:flex;gap:4px;align-items:center;font-size:10px;opacity:.8;flex-wrap:wrap}
 .sg-quick button{font-size:10px;padding:2px 5px}
+.sg-quick label{display:inline-flex;align-items:center;gap:3px;cursor:pointer;opacity:1;white-space:nowrap}
+.sg-quick input[type=checkbox]{width:auto;flex:none;padding:0;margin:0;accent-color:#1d6fc4}
+.sg-quick label.sg-r18{color:#ff9d7a;font-weight:600}
 .sg-modes{display:flex;gap:4px;align-items:center;flex:none;flex-wrap:wrap;font-size:10px}
 .sg-modes>span{opacity:.65;margin-left:3px}
 .sg-modes button{font-size:10px;padding:3px 7px}
@@ -184,6 +187,21 @@ function findLoopTarget() {
   return null;
 }
 
+/** 运行提交成功后自动取消所有已点选的图片。
+ *  本次提交经过的图库节点全部清空（工作流里放多个节点时也不会漏），
+ *  但图库网格本身保留，用户可以接着点下一批，不用重新搜索。 */
+function clearSubmittedSelections() {
+  for (const p of PANELS.values()) {
+    if (!p || typeof p.clearSelection !== "function") continue;
+    if (p.getState().selected.length === 0) continue;
+    try {
+      p.clearSelection("已提交运行 · 选区已自动清空，可继续点选新图");
+    } catch (e) {
+      console.warn("[ShangguWebGallery] 清空选区失败:", e);
+    }
+  }
+}
+
 function installRunLoop() {
   if (app.__sgGalleryRunLoop) return;
   if (typeof app.queuePrompt !== "function") {
@@ -196,32 +214,50 @@ function installRunLoop() {
   app.queuePrompt = async function (number, batchCount = 1, options = {}) {
     if (fanoutBusy) return original(number, batchCount, options);
     const target = findLoopTarget();
-    if (!target) return original(number, batchCount, options);
+    let result = null;
+    let submitted = false;
 
-    const files = target.getState().selected.slice();
-    const n = files.length;
-    // 插队(-1)要倒序提交，队列里的实际执行顺序才等于点选顺序
-    const order = number === -1 ? files.slice().reverse() : files;
-    let last = null, done = 0;
-    fanoutBusy = true;
-    try {
-      target.progress(0, n);
-      for (const one of order) {
-        target.setOverride(JSON.stringify([one]));
-        last = await original(number, 1, options);
-        done += 1;
-        target.progress(done, n);
+    if (!target) {
+      // 单图（或只选了 1 张）：走原生提交，成功后照样清空选区
+      result = await original(number, batchCount, options);
+      submitted = true;
+    } else {
+      const files = target.getState().selected.slice();
+      const n = files.length;
+      // 插队(-1)要倒序提交，队列里的实际执行顺序才等于点选顺序
+      const order = number === -1 ? files.slice().reverse() : files;
+      let last = null, done = 0;
+      fanoutBusy = true;
+      try {
+        target.progress(0, n);
+        for (const one of order) {
+          target.setOverride(JSON.stringify([one]));
+          last = await original(number, 1, options);
+          done += 1;
+          target.progress(done, n);
+        }
+        result = last;
+        submitted = true;
+      } catch (err) {
+        console.error("[ShangguWebGallery] 循环执行失败:", err);
+        if (done === 0) {
+          result = await original(number, batchCount, options);
+          submitted = true;
+        } else {
+          // 已经提交了一部分，也算跑过，选区一样清空
+          result = last;
+          submitted = true;
+        }
+      } finally {
+        target.setOverride(null);
+        fanoutBusy = false;
+        setTimeout(() => target.progress(0, 0), 2500);
       }
-      return last;
-    } catch (err) {
-      console.error("[ShangguWebGallery] 循环执行失败:", err);
-      if (done === 0) return original(number, batchCount, options);
-      return last;
-    } finally {
-      target.setOverride(null);
-      fanoutBusy = false;
-      setTimeout(() => target.progress(0, 0), 2500);
     }
+
+    // 必须放在扇出的 finally 之后：override 已复位，这里写 "[]" 才不会被恢复覆盖
+    if (submitted) clearSubmittedSelections();
+    return result;
   };
 }
 
@@ -260,7 +296,17 @@ function buildPanel(node) {
   const quick = el("div", "sg-quick");
   quick.appendChild(el("span", "", "快捷:"));
   const btnPreset = el("button", "", "civitai.red 图库(API)");
-  quick.appendChild(btnPreset);
+  const btnPresetAitag = el("button", "", "aitag.win");
+  quick.append(btnPreset, btnPresetAitag);
+  // 18+ 开关：aitag.win 的主要内容在 show_r18=1 里，默认开启
+  const r18Label = el("label", "sg-r18", "18+");
+  const r18Chk = el("input");
+  r18Chk.type = "checkbox";
+  r18Chk.checked = true;
+  r18Chk.title = "开启后请求 aitag.win 的 18+ 作品（默认开启）；关闭只看全年龄内容";
+  r18Label.title = r18Chk.title;
+  r18Label.prepend(r18Chk);
+  quick.appendChild(r18Label);
   paneUrl.append(rowUrl, quick);
   panes.url = paneUrl;
 
@@ -351,9 +397,10 @@ function buildPanel(node) {
   });
   adv.appendChild(advGrid);
   const advHint = el("div", "sg-hint",
-    "提示：输入 https://civitai.red/images 会自动切到同站 JSON 接口（网页版有 Cloudflare）。" +
+    "提示：输入 https://aitag.win/ 或 https://civitai.red/images 会自动切到同站 JSON 接口；" +
+    "网址下方的「18+」勾选框控制是否请求 aitag.win 的成人内容（默认开启）。" +
     "运行次数只看「单图 / 多图」：单图一次只跑 1 张；多图按点选顺序，每张图各提交一次独立运行，" +
-    "队列里会依次出现 N 个任务，属正常现象。");
+    "队列里会依次出现 N 个任务，属正常现象。运行提交成功后会自动清空已选图片，可直接点下一批。");
   adv.appendChild(advHint);
   root.appendChild(adv);
 
@@ -385,6 +432,7 @@ function buildPanel(node) {
     const s = {};
     Object.entries(fields).forEach(([k, inp]) => { s[k] = inp.value; });
     s.safe_only = fields.safe_only.value === "yes";
+    s.r18 = r18Chk.checked;
     try { s.per_page = Math.max(1, Math.min(400, parseInt(s.per_page || "200", 10))); }
     catch (e) { s.per_page = 200; }
     node.properties.sg_settings = s;
@@ -398,6 +446,8 @@ function buildPanel(node) {
         inp.value = k === "safe_only" ? (s[k] === false ? "no" : "yes") : String(s[k]);
       }
     });
+    // 老工作流没存过 r18，默认开启（用户要的就是站点 18+ 内容）
+    r18Chk.checked = s.r18 === undefined ? true : !!s.r18;
   }
 
   const currentSerialized = () =>
@@ -621,6 +671,13 @@ function buildPanel(node) {
   btnSearch.onclick = () => { rememberUrl(urlInput.value.trim()); doFetch(true); };
   urlInput.onchange = () => rememberUrl(urlInput.value.trim());
   btnPreset.onclick = () => { urlInput.value = PRESET; rememberUrl(PRESET); doFetch(true); };
+  btnPresetAitag.onclick = () => {
+    const u = "https://aitag.win/";
+    urlInput.value = u;
+    r18Chk.checked = true;
+    rememberUrl(u);
+    doFetch(true);
+  };
   btnMore.onclick = () => doFetch(false);
   btnParse.onclick = doParse;
   btnCopyBM.onclick = async () => {
@@ -666,12 +723,19 @@ function buildPanel(node) {
       if (!state.selectedByUrl.has(it.url)) await toggleSelect(it);
     }
   };
-  btnClear.onclick = () => {
+  /** 清空选区（保留图库网格）。note 只在「运行后自动清空」时传，手动清空不弹提示。 */
+  function clearSelection(note) {
+    if (state.override != null) return;   // 扇出进行中，别动选区
     state.selected = [];
     state.selectedByUrl.clear();
-    syncWidget();
-    refreshBadges();
-  };
+    const sw = w("selected_files");
+    if (sw) sw.value = "[]";
+    node.properties.sg_selected = [];
+    syncWidget();          // 同步 widget 值 / properties / 状态栏
+    refreshBadges();       // 去掉每个格子上的序号和选中框
+    if (note) setStatus(note, false);
+  }
+  btnClear.onclick = () => clearSelection();
 
   // 从工作流恢复：widget 值与 properties 双保险
   function restore() {
@@ -742,6 +806,7 @@ function buildPanel(node) {
     syncRowHeight,
     getState: () => state,
     getSelectMode: selectMode,
+    clearSelection: (note) => clearSelection(note),
     setOverride(v) {
       state.override = v;
       const sw = w("selected_files");

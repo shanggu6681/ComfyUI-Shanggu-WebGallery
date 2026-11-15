@@ -15,6 +15,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# 本地导出的仓库副本（含独立 .git，不要递归提交）
+ComfyUI-Shanggu-WebGallery/
+
 # 本地凭据（切勿提交）
 _gh_token.txt
 *.token

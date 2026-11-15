@@ -52,6 +52,9 @@ def _clean_settings(raw: Any) -> dict:
     keys = ("cookie", "ua", "referer", "proxy", "url_regex", "page_template", "safe_only", "per_page")
     out = {k: raw.get(k, "") for k in keys}
     out["safe_only"] = raw.get("safe_only", True) is not False
+    # 18+ 开关：默认开启（aitag.win 这类站点的主要内容就在 show_r18=1 里）
+    rv = raw.get("r18", True)
+    out["r18"] = rv is not False and str(rv).lower() not in ("false", "0", "no", "off", "")
     try:
         out["per_page"] = max(1, min(400, int(raw.get("per_page") or 200)))
     except Exception:
@@ -71,8 +74,12 @@ def _new_items(s: dict, items: list[dict]) -> list[dict]:
     return out
 
 
-def rewrite_gallery_url(url: str) -> tuple[str, bool]:
-    """网页版图库被 Cloudflare 挡住时，自动改用同站的官方 JSON 接口。"""
+def rewrite_gallery_url(url: str, r18: bool = True) -> tuple[str, bool]:
+    """网页版图库被 Cloudflare 挡住 / 是 SPA 时，自动改用同站的官方 JSON 接口。
+
+    返回值第二个元素只表示「网页地址被换成接口」，用于前端提示；
+    18+ 参数的同步不算改写，但仍会返回调整后的地址。
+    """
     try:
         p = urllib.parse.urlsplit(url)
         host = (p.netloc or "").lower().split(":")[0]
@@ -82,10 +89,8 @@ def rewrite_gallery_url(url: str) -> tuple[str, bool]:
     except Exception:
         pass
     # SPA 图库（HTML 里没有图片，全靠 JS 调自家 JSON 接口）
-    extra, hit = adapters.rewrite_extra(url)
-    if hit:
-        return extra, True
-    return url, False
+    extra, hit = adapters.rewrite_extra(url, r18)
+    return extra or url, bool(hit)
 
 
 def _render_template(tpl: str, base: str, page: int) -> str:
@@ -138,7 +143,7 @@ async def handle_fetch(request: web.Request) -> web.Response:
 
     rewritten = False
     if reset:
-        url, rewritten = rewrite_gallery_url(url)
+        url, rewritten = rewrite_gallery_url(url, bool(settings.get("r18", True)))
         s["base"] = url
         s["next"] = None
         s["page"] = 1
