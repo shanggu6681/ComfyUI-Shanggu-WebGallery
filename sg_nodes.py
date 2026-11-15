@@ -2,9 +2,12 @@
 """节点本体：把图库里点选的图片变成 ComfyUI 的 IMAGE / MASK 张量。
 
 - 单张时行为与内置 LoadImage 完全一致，可以直接替换「加载图像」节点；
-- 多张时输出一个 IMAGE 批次 [N,H,W,C]，下游图生图节点会自然地对每张各出一张图；
-- 如果选择「逐张完整执行」，前端会把一次 Run 拆成 N 个 prompt，
-  每个 prompt 只带一张图，整个下游工作流会真正被跑 N 遍。
+- 「单图」选择模式：点任意图片自动替换当前选中，永远只加载一张；
+- 「多图」选择模式：可累加选中多张；
+- 多图 + 「逐张完整执行」：前端把一次 Run 串行拆成 N 个独立 prompt，
+  每个 prompt 只带一张图，整个下游工作流真正跑 N 遍（推荐）；
+- 多图 + 「批量一次执行」：输出 IMAGE 批次 [N,H,W,C]，工作流只跑 1 次，
+  要求下游节点支持 batch，且显存要够（等价于文件夹批量导入型工作流）。
 """
 from __future__ import annotations
 
@@ -18,6 +21,9 @@ from PIL import Image, ImageOps
 
 MODE_BATCH = "批量一次执行"
 MODE_QUEUE = "逐张完整执行"
+SEL_SINGLE = "单图(点选替换)"
+SEL_MULTI = "多图(累加)"
+SELECT_MODES = [SEL_SINGLE, SEL_MULTI]
 SIZE_MODES = ["等比缩放+填充", "等比缩放+居中裁剪", "直接拉伸", "不统一(需同尺寸)"]
 
 DEFAULT_SITE = "https://civitai.red/api/v1/images?limit=20"
@@ -113,24 +119,34 @@ class ShangguWebImageGallery:
                     "default": "[]", "multiline": True,
                     "tooltip": "由节点面板点选图片时自动写入，一般不用手改",
                 }),
-                "multi_mode": ([MODE_BATCH, MODE_QUEUE], {
-                    "default": MODE_BATCH,
-                    "tooltip": "批量=一次执行输出N张；逐张=完整工作流跑N次",
+                "multi_mode": ([MODE_QUEUE, MODE_BATCH], {
+                    "default": MODE_QUEUE,
+                    "tooltip": "逐张=每个选中图完整跑一遍工作流(推荐)；批量=一次执行输出N张的IMAGE批次",
                 }),
                 "size_mode": (SIZE_MODES, {"default": SIZE_MODES[0]}),
                 "target_width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 64}),
                 "target_height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 64}),
-            }
+            },
+            # 放在 optional：老版本工作流里没有这个键也不会触发 required 校验失败
+            "optional": {
+                "select_mode": (SELECT_MODES, {
+                    "default": SEL_SINGLE,
+                    "tooltip": "单图=点哪个换哪个；多图=可累加多选，逐张模式下每图跑一次工作流",
+                }),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "STRING")
     RETURN_NAMES = ("images", "masks", "count", "info_json")
     FUNCTION = "load_gallery"
     CATEGORY = "image/Shanggu 网页图库"
-    DESCRIPTION = "浏览网页图片、点选加载，等价于 LoadImage；多图可批量或逐张执行下游工作流。"
+    DESCRIPTION = "浏览网页图片、点选加载，等价于 LoadImage；单图/多图开关，多图可让下游工作流逐张执行 N 次。"
 
     def load_gallery(self, site_url, selected_files, multi_mode, size_mode,
-                     target_width, target_height):
+                     target_width, target_height, select_mode=SEL_SINGLE):
+        # select_mode 只控制前端「点哪个换哪个」的交互；真正加载几张完全由
+        # selected_files 决定。这里不做截断，避免老工作流缺少该可选参数时
+        # 把多图批次误裁成一张。
         entries = _entries(selected_files)
         if not entries:
             raise ValueError(
@@ -150,16 +166,15 @@ class ShangguWebImageGallery:
             loaded.append((rgb, mask, e))
 
         sizes = {rgb.size for rgb, _, _ in loaded}
-        # 逐张完整执行时每次只有一张图，无需拼批次，直接保留原图分辨率
-        keep_original = (size_mode == "不统一(需同尺寸)") or (
-            multi_mode == MODE_QUEUE and len(loaded) == 1
-        )
+        # 统一按 size_mode 缩放到 target_width/height：网页原图常常是 1500~3000px，
+        # 直接送进 1024 工作流会让 latent 暴涨、16GB 显存直接卡住/爆显存。
+        # 只有用户明确选「不统一(需同尺寸)」时才保留原分辨率。
+        keep_original = (size_mode == "不统一(需同尺寸)")
         if keep_original:
             if len(sizes) > 1:
                 raise ValueError(
                     f"[Shanggu 网页图库] 选中的图片尺寸不一致 {sorted(sizes)}，"
-                    "IMAGE 批次要求同宽高。请改用「等比缩放+填充」等尺寸统一方式，"
-                    "或把 multi_mode 设为「逐张完整执行」。"
+                    "IMAGE 批次要求同宽高。请把 size_mode 改成「等比缩放+填充」等统一尺寸方式。"
                 )
             tw, th = next(iter(sizes))
         else:

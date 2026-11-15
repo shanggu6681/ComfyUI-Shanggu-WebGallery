@@ -287,11 +287,22 @@ async def handle_select(request: web.Request) -> web.Response:
         input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input")
     os.makedirs(input_dir, exist_ok=True)
 
+    stem = "sg_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
     ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         ext = ".jpg"
-    filename = "sg_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ext
+    filename = stem + ext
     dest = os.path.join(input_dir, filename)
+
+    # 下载时会按 Content-Type 改扩展名（.jpeg→.jpg / .jpg→.png），若只按
+    # URL 后缀查缓存就会每次点选都重新下载几 MB 原图。同 hash 的任意变体
+    # 都视为命中缓存，单图模式「点哪个换哪个」才不会卡。
+    if not os.path.isfile(dest):
+        for cand_ext in (".jpg", ".jpeg", ".png", ".webp"):
+            cand = os.path.join(input_dir, stem + cand_ext)
+            if os.path.isfile(cand):
+                filename, dest = stem + cand_ext, cand
+                break
 
     if not os.path.isfile(dest):
         try:
@@ -307,7 +318,7 @@ async def handle_select(request: web.Request) -> web.Response:
                 ext = ".png"
             elif "jpeg" in ctype or "jpg" in ctype:
                 ext = ".jpg"
-            filename = "sg_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:16] + ext
+            filename = stem + ext
             dest = os.path.join(input_dir, filename)
             from PIL import Image, ImageOps
             try:

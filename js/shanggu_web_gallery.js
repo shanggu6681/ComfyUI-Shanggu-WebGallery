@@ -1,15 +1,23 @@
 // ComfyUI-Shanggu-WebGallery — 前端扩展
 // 面板：网址抓取 / 粘贴源码 / 浏览器桥接；滚动加载；点选即等价于 LoadImage。
+// 单图/多图开关；多图「逐张完整执行」= 一次 Run 串行提交 N 个独立 prompt。
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_TYPE = "ShangguWebImageGallery";
 const MODE_QUEUE = "逐张完整执行";
+const MODE_BATCH = "批量一次执行";
+const SEL_SINGLE = "单图(点选替换)";
+const SEL_MULTI = "多图(累加)";
 const BASE = api.api_base || "";
 // api.fetchApi 会自己补 api_base + "/api"，所以传纯路径；<img src> 走不带 /api 的直连路径
 const EP = (p) => "/sg_gallery/" + p;
 const FULL = (p) => BASE + "/sg_gallery/" + p;
 const PRESET = "https://civitai.red/api/v1/images?limit=20";
+const MAX_TILES = 400;   // 无限滚动的 DOM 上限，防止几百张缩略图把前端拖垮
+
+/* 面板注册表：全局 Run 拦截器用它找到画布上处于「逐张执行 + 多选」的图库节点 */
+const PANELS = new Map();
 
 /* ------------------------------------------------------------------ 样式 */
 const CSS = `
@@ -22,6 +30,9 @@ const CSS = `
 .sg-root button{cursor:pointer;background:var(--comfy-menu-bg,#353535);white-space:nowrap}
 .sg-root button:hover{border-color:#4c9ffe;color:#fff}
 .sg-root button.sg-primary{background:#1d6fc4;border-color:#1d6fc4;color:#fff;font-weight:600}
+.sg-root button.sg-go{background:#18804a;border-color:#18804a;color:#fff;font-weight:600}
+.sg-root button.sg-on{border-color:#4c9ffe;color:#8ec5ff;background:#203a55}
+.sg-root button:disabled{opacity:.45;cursor:default}
 .sg-root input:focus,.sg-root textarea:focus{border-color:#4c9ffe}
 .sg-tabs{display:flex;gap:4px;flex:none}
 .sg-tabs button{flex:1;padding:4px 2px;font-size:11px;opacity:.75}
@@ -33,12 +44,20 @@ const CSS = `
 .sg-root textarea{width:100%;height:64px;resize:vertical;font-size:11px}
 .sg-quick{display:flex;gap:4px;align-items:center;font-size:10px;opacity:.8;flex-wrap:wrap}
 .sg-quick button{font-size:10px;padding:2px 5px}
+.sg-modes{display:flex;gap:4px;align-items:center;flex:none;flex-wrap:wrap;font-size:10px}
+.sg-modes>span{opacity:.65;margin-left:3px}
+.sg-modes button{font-size:10px;padding:3px 7px}
 .sg-status{flex:none;min-height:16px;font-size:10.5px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sg-status.sg-err{color:#ff8a80;opacity:1}
-.sg-grid{flex:1;min-height:120px;overflow-y:auto;overflow-x:hidden;display:grid;
-  grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:5px;align-content:start;
+.sg-status.sg-run{color:#7fe3a5;opacity:1;font-weight:600}
+/* 关键：显式固定行高。依赖 aspect-ratio 的隐式行高在溢出 100+ 格时会被
+   浏览器压缩成十几 px 的横条（图片挤在一起），这里由 JS 按实际列宽设定。 */
+.sg-grid{flex:1 1 auto;min-height:120px;min-width:0;overflow-y:auto;overflow-x:hidden;display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(88px,1fr));
+  grid-auto-rows:96px;grid-auto-flow:row;align-content:start;gap:5px;
   background:rgba(0,0,0,.18);border:1px solid var(--border-color,#444);border-radius:4px;padding:5px}
-.sg-tile{position:relative;aspect-ratio:1/1;border:2px solid transparent;border-radius:4px;overflow:hidden;
+.sg-tile{position:relative;width:100%;height:100%;min-width:0;min-height:0;
+  border:2px solid transparent;border-radius:4px;overflow:hidden;
   background:#111;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .sg-tile img{width:100%;height:100%;object-fit:cover;display:block}
 .sg-tile.sg-sel{border-color:#3ea6ff;box-shadow:0 0 0 1px #3ea6ff inset}
@@ -82,8 +101,7 @@ async function postJSON(path, body) {
 function parseFiles(raw) {
   try {
     const v = JSON.parse(raw || "[]");
-    if (Array.isArray(v)) return v;
-    return [];
+    return Array.isArray(v) ? v : [];
   } catch (e) {
     return [];
   }
@@ -139,36 +157,67 @@ function sgBridgeBookmarklet() {
 }
 const BOOKMARKLET = "javascript:(" + sgBridgeBookmarklet.toString() + ")()";
 
-/* ------------------------------------------------- 一次 Run 扇出 N 次执行 */
-function installQueueFanout() {
-  if (api.__sgGalleryFanout) return;
-  api.__sgGalleryFanout = true;
-  const original = api.queuePrompt.bind(api);
-  api.queuePrompt = async function (number, payload, options) {
-    try {
-      const output = payload && payload.output;
-      if (!output) return original(number, payload, options);
-      let targetId = null, files = null;
-      for (const [id, n] of Object.entries(output)) {
-        if (!n || n.class_type !== NODE_TYPE) continue;
-        if (n.inputs && n.inputs.multi_mode !== MODE_QUEUE) continue;
-        const f = parseFiles(n.inputs && n.inputs.selected_files);
-        if (f.length > 1) { targetId = id; files = f; break; }
-      }
-      if (!targetId) return original(number, payload, options);
+/* --------------------------------------------- 循环执行：一次 Run => N 次
+ * ComfyUI 单次 prompt 是一张静态 DAG，节点本身没法「回头」重跑下游。
+ * 真正跑 N 遍的唯一稳妥办法是提交 N 个独立 prompt。
+ *
+ * 旧做法是拦截 api.queuePrompt 一次塞 N 个 —— 那样 app.queuePrompt 只记录
+ * 最后一个 job，前端进度/队列状态机对不上，看起来就像「卡住」。
+ * 现在改为拦截 app.queuePrompt：每轮临时把 selected_files 改成单张，再串行
+ * 调用原始 queuePrompt(…, 1, …)。每一轮都是完整的一次提交（graphToPrompt、
+ * beforeQueued、job 记录、processingQueue 复位全部走原生流程），所以不会卡。
+ */
+let fanoutBusy = false;
 
-      // 插队模式(-1)要倒序提交，队列里的执行顺序才和点选顺序一致
-      const order = number === -1 ? files.slice().reverse() : files;
-      let last = null;
+function findLoopTarget() {
+  const graph = app.graph;
+  const nodes = graph && (graph._nodes || graph.nodes);
+  const alive = Array.isArray(nodes) ? nodes : null;
+  for (const p of PANELS.values()) {
+    if (!p) continue;
+    if (alive && !alive.includes(p.node)) continue;
+    if (p.getMode() === MODE_QUEUE && p.getState().selected.length > 1) return p;
+  }
+  return null;
+}
+
+function installRunLoop() {
+  if (app.__sgGalleryRunLoop) return;
+  if (typeof app.queuePrompt !== "function") {
+    console.warn("[ShangguWebGallery] app.queuePrompt 不可用，逐张执行按钮仍可用");
+    return;
+  }
+  app.__sgGalleryRunLoop = true;
+  const original = app.queuePrompt.bind(app);
+
+  app.queuePrompt = async function (number, batchCount = 1, options = {}) {
+    if (fanoutBusy) return original(number, batchCount, options);
+    const target = findLoopTarget();
+    if (!target) return original(number, batchCount, options);
+
+    const files = target.getState().selected.slice();
+    const n = files.length;
+    // 插队(-1)要倒序提交，队列里的实际执行顺序才等于点选顺序
+    const order = number === -1 ? files.slice().reverse() : files;
+    let last = null, done = 0;
+    fanoutBusy = true;
+    try {
+      target.progress(0, n);
       for (const one of order) {
-        const clone = JSON.parse(JSON.stringify(output));
-        clone[targetId].inputs.selected_files = JSON.stringify([one]);
-        last = await original(number, { output: clone, workflow: payload.workflow }, options);
+        target.setOverride(JSON.stringify([one]));
+        last = await original(number, 1, options);
+        done += 1;
+        target.progress(done, n);
       }
-      return last || {};
+      return last;
     } catch (err) {
-      console.error("[ShangguWebGallery] 逐张排队失败，回退为普通执行:", err);
-      return original(number, payload, options);
+      console.error("[ShangguWebGallery] 循环执行失败:", err);
+      if (done === 0) return original(number, batchCount, options);
+      return last;
+    } finally {
+      target.setOverride(null);
+      fanoutBusy = false;
+      setTimeout(() => target.progress(0, 0), 2500);
     }
   };
 }
@@ -246,13 +295,26 @@ function buildPanel(node) {
 
   root.append(paneUrl, panePaste, paneBridge);
 
+  /* --- 选择模式 / 执行模式 开关 --- */
+  const modeBar = el("div", "sg-modes");
+  modeBar.appendChild(el("span", "", "选图"));
+  const btnSingle = el("button", "", "单图");
+  const btnMulti = el("button", "", "多图");
+  modeBar.append(btnSingle, btnMulti);
+  modeBar.appendChild(el("span", "", "执行"));
+  const btnQueueMode = el("button", "", "逐张 N 次");
+  const btnBatchMode = el("button", "", "批量 1 次");
+  modeBar.append(btnQueueMode, btnBatchMode);
+  root.appendChild(modeBar);
+
   const status = el("div", "sg-status", "就绪：填写网址后点「搜索」");
   const grid = el("div", "sg-grid");
   const footer = el("div", "sg-footer");
+  const btnRun = el("button", "sg-go", "▶ 运行");
   const btnMore = el("button", "", "加载更多");
   const btnAll = el("button", "", "全选可见");
   const btnClear = el("button", "", "清空选择");
-  footer.append(btnMore, btnAll, btnClear);
+  footer.append(btnRun, btnMore, btnAll, btnClear);
   root.append(status, grid, footer);
 
   /* --- 高级设置 --- */
@@ -290,13 +352,14 @@ function buildPanel(node) {
   adv.appendChild(advGrid);
   const advHint = el("div", "sg-hint",
     "提示：输入 https://civitai.red/images 会自动切到同站 JSON 接口（网页版有 Cloudflare）；" +
-    "其他站点若被拦，可填 Cookie、用「粘贴源码」，或用「浏览器桥接」书签。");
+    "「逐张 N 次」= 每张图完整跑一遍工作流（推荐），「批量 1 次」= 输出 IMAGE 批次，只跑一次且要求下游支持 batch。");
   adv.appendChild(advHint);
   root.appendChild(adv);
 
-  const setStatus = (msg, isErr = false) => {
+  const setStatus = (msg, isErr = false, running = false) => {
     status.textContent = msg;
     status.classList.toggle("sg-err", !!isErr);
+    status.classList.toggle("sg-run", !!running);
   };
 
   const w = (name) => (node.widgets || []).find((x) => x.name === name);
@@ -310,14 +373,16 @@ function buildPanel(node) {
     loading: false,
     page: 0,
     rewriteHint: "",
+    truncated: false,
+    override: null,      // 循环执行期间临时写入 prompt 的单张 JSON
+    runTotal: 0,
+    runDone: 0,
   };
   node.properties.sg_session = state.sid;
 
   function collectSettings() {
     const s = {};
-    Object.entries(fields).forEach(([k, inp]) => {
-      s[k] = inp.value;
-    });
+    Object.entries(fields).forEach(([k, inp]) => { s[k] = inp.value; });
     s.safe_only = fields.safe_only.value === "yes";
     try { s.per_page = Math.max(1, Math.min(400, parseInt(s.per_page || "200", 10))); }
     catch (e) { s.per_page = 200; }
@@ -334,23 +399,74 @@ function buildPanel(node) {
     });
   }
 
+  const currentSerialized = () =>
+    state.override != null ? state.override : JSON.stringify(state.selected);
+
   function syncWidget() {
     const ww = w("selected_files");
-    if (ww) ww.value = JSON.stringify(state.selected);
+    if (ww && state.override == null) ww.value = JSON.stringify(state.selected);
     node.properties.sg_selected = state.selected;
     node.properties.sg_items = state.items.slice(0, 600);
     node.setDirtyCanvas(true, true);
     updateStatus();
   }
 
+  function selectMode() {
+    const sm = w("select_mode");
+    return (sm && sm.value) || node.properties.sg_select_mode || SEL_SINGLE;
+  }
+
+  function execMode() {
+    const mm = w("multi_mode");
+    return (mm && mm.value) || MODE_QUEUE;
+  }
+
+  function syncModeButtons() {
+    const s = selectMode();
+    const e = execMode();
+    btnSingle.classList.toggle("sg-on", s === SEL_SINGLE);
+    btnMulti.classList.toggle("sg-on", s === SEL_MULTI);
+    btnQueueMode.classList.toggle("sg-on", e === MODE_QUEUE);
+    btnBatchMode.classList.toggle("sg-on", e === MODE_BATCH);
+    const n = Math.max(1, state.selected.length);
+    btnRun.textContent = e === MODE_BATCH ? "▶ 运行(批量 1 次)" : "▶ 运行(" + n + " 次)";
+    btnRun.title = e === MODE_BATCH
+      ? "一次执行，输出 IMAGE 批次（要求下游节点支持 batch）"
+      : "每张选中图各提交一个独立 prompt，完整工作流跑 N 次";
+  }
+
   function updateStatus() {
-    const mode = (w("multi_mode") || {}).value || "批量一次执行";
+    if (state.runTotal > 0) {
+      setStatus(`循环执行中 ${state.runDone}/${state.runTotal} · 每张图各跑一次完整工作流`, false, true);
+      return;
+    }
+    const sm = selectMode() === SEL_SINGLE ? "单图(点哪个换哪个)" : "多图(可累加)";
+    const em = execMode() === MODE_QUEUE
+      ? `逐张执行(跑 ${Math.max(1, state.selected.length)} 次)`
+      : "批量一次执行";
     setStatus(
-      `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张` +
+      `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张 · ${sm} · ${em}` +
       (state.hasMore ? " · 向下滚动继续加载" : "") +
-      ` · ${mode === MODE_QUEUE ? "逐张完整执行(跑 " + state.selected.length + " 次)" : "批量一次执行"}` +
-      state.rewriteHint
+      (state.truncated ? " · 已达显示上限" : "") + state.rewriteHint
     );
+    syncModeButtons();
+  }
+
+  /* 按实际列宽固定 grid 行高，保证每格都是正方形，绝不被压成横条 */
+  function syncRowHeight() {
+    let cw = 0;
+    const first = grid.querySelector(".sg-tile");
+    if (first) cw = first.offsetWidth || first.clientWidth || 0;
+    if (!cw) {
+      const inner = grid.clientWidth - 10;
+      cw = Math.max(64, Math.min(140, Math.floor(inner / 4)));
+    }
+    const row = Math.max(64, Math.round(cw));
+    if (grid.__sgRow !== row) {
+      grid.__sgRow = row;
+      grid.style.gridAutoRows = row + "px";
+    }
+    return row;
   }
 
   function refreshBadges() {
@@ -368,9 +484,10 @@ function buildPanel(node) {
   }
 
   function appendItems(items) {
-    items.forEach((it) => {
-      if (!it || !it.url) return;
-      if (state.items.some((x) => x.url === it.url)) return;
+    for (const it of items) {
+      if (!it || !it.url) continue;
+      if (state.items.some((x) => x.url === it.url)) continue;
+      if (grid.children.length >= MAX_TILES) { state.truncated = true; break; }
       state.items.push(it);
       const tile = el("div", "sg-tile");
       tile.dataset.url = it.url;
@@ -391,7 +508,8 @@ function buildPanel(node) {
       }
       tile.onclick = () => toggleSelect(it);
       grid.appendChild(tile);
-    });
+    }
+    syncRowHeight();
     refreshBadges();
     updateStatus();
   }
@@ -415,8 +533,14 @@ function buildPanel(node) {
         filename: r.filename, url: it.url,
         prompt: it.prompt || "", id: it.id || "",
       };
-      state.selected.push(entry);
-      state.selectedByUrl.set(it.url, entry);
+      if (selectMode() === SEL_SINGLE) {
+        // 单图开关：点哪个换哪个，永远只保留最后点的这一张
+        state.selected = [entry];
+        state.selectedByUrl = new Map([[it.url, entry]]);
+      } else {
+        state.selected.push(entry);
+        state.selectedByUrl.set(it.url, entry);
+      }
       syncWidget();
       refreshBadges();
     } catch (e) {
@@ -426,7 +550,7 @@ function buildPanel(node) {
 
   async function doFetch(reset) {
     if (state.loading) return;
-    if (!reset && !state.hasMore) return;
+    if (!reset && (!state.hasMore || state.truncated)) return;
     state.loading = true;
     btnMore.disabled = true;
     if (reset) {
@@ -434,6 +558,7 @@ function buildPanel(node) {
       state.items = [];
       state.hasMore = true;
       state.page = 0;
+      state.truncated = false;
     }
     setStatus("正在抓取网页…");
     try {
@@ -449,7 +574,7 @@ function buildPanel(node) {
       } else {
         state.rewriteHint = r.rewritten ? " · 网页被拦截，已自动改用 JSON 接口" : "";
         appendItems(r.items || []);
-        state.hasMore = !!r.has_more;
+        state.hasMore = !!r.has_more && !state.truncated;
         state.page = r.page || 0;
         if (r.message && !(r.items || []).length) setStatus(r.message, false);
         else updateStatus();
@@ -476,7 +601,9 @@ function buildPanel(node) {
         settings: collectSettings(),
       });
       if (!r.ok) { setStatus(r.error || "解析失败", true); return; }
-      if (!appendChk.checked) { grid.innerHTML = ""; state.items = []; }
+      if (!appendChk.checked) {
+        grid.innerHTML = ""; state.items = []; state.truncated = false;
+      }
       appendItems(r.items || []);
       state.hasMore = false;
       if (r.message && !(r.items || []).length) setStatus(r.message, false);
@@ -495,16 +622,9 @@ function buildPanel(node) {
     if (ww) ww.value = value;
     node.properties.sg_url = value;
   }
-  btnSearch.onclick = () => {
-    rememberUrl(urlInput.value.trim());
-    doFetch(true);
-  };
+  btnSearch.onclick = () => { rememberUrl(urlInput.value.trim()); doFetch(true); };
   urlInput.onchange = () => rememberUrl(urlInput.value.trim());
-  btnPreset.onclick = () => {
-    urlInput.value = PRESET;
-    rememberUrl(PRESET);
-    doFetch(true);
-  };
+  btnPreset.onclick = () => { urlInput.value = PRESET; rememberUrl(PRESET); doFetch(true); };
   btnMore.onclick = () => doFetch(false);
   btnParse.onclick = doParse;
   btnCopyBM.onclick = async () => {
@@ -513,8 +633,47 @@ function buildPanel(node) {
       setStatus("书签代码已复制，新建一个书签并把代码粘到网址栏即可");
     } catch (e) { setStatus("复制失败，请手动展开高级设置查看", true); }
   };
+
+  /* --- 模式开关 --- */
+  function setSelectMode(v) {
+    const sm = w("select_mode");
+    if (sm) sm.value = v;
+    node.properties.sg_select_mode = v;
+    if (v === SEL_SINGLE && state.selected.length > 1) {
+      const keep = state.selected[0];
+      state.selected = [keep];
+      state.selectedByUrl = new Map(keep.url ? [[keep.url, keep]] : []);
+      syncWidget();
+      refreshBadges();
+    }
+    updateStatus();
+  }
+  function setExecMode(v) {
+    const mm = w("multi_mode");
+    if (mm) mm.value = v;
+    updateStatus();
+  }
+  btnSingle.onclick = () => setSelectMode(SEL_SINGLE);
+  btnMulti.onclick = () => setSelectMode(SEL_MULTI);
+  btnQueueMode.onclick = () => setExecMode(MODE_QUEUE);
+  btnBatchMode.onclick = () => setExecMode(MODE_BATCH);
+
+  /* --- 运行按钮：与 ComfyUI 的 Run 走同一条链路，自动扇出 --- */
+  btnRun.onclick = async () => {
+    if (!state.selected.length) { setStatus("请先点选至少一张图片", true); return; }
+    if (state.runTotal > 0) { setStatus("循环执行进行中，请等待本轮结束", true); return; }
+    try {
+      await app.queuePrompt(0, 1, {});
+    } catch (e) {
+      setStatus("执行失败: " + e, true);
+    }
+  };
+
   btnAll.onclick = async () => {
+    // 「全选可见」隐含多选意图，自动切到多图模式
+    if (selectMode() === SEL_SINGLE) setSelectMode(SEL_MULTI);
     for (const it of state.items) {
+      if (grid.children.length >= MAX_TILES && state.truncated) break;
       if (!state.selectedByUrl.has(it.url)) await toggleSelect(it);
     }
   };
@@ -536,9 +695,14 @@ function buildPanel(node) {
     const sw = w("site_url");
     urlInput.value = (sw && sw.value) || node.properties.sg_url || PRESET;
     restoreSettings();
+    if (node.properties.sg_select_mode) {
+      const sm = w("select_mode");
+      if (sm) sm.value = node.properties.sg_select_mode;
+    }
     state.items = (node.properties.sg_items || []).slice(0, 600);
     grid.innerHTML = "";
     appendItems(state.items);
+    syncModeButtons();
     updateStatus();
   }
 
@@ -554,13 +718,22 @@ function buildPanel(node) {
     const ww = w(name);
     if (ww) ww.hidden = true;
   });
-  // graphToPrompt 优先读 serializeValue，保证隐藏 widget 的值一定进 prompt
+  // graphToPrompt 优先读 serializeValue；循环执行期间必须让它读到单张覆盖值
   const selWidget = w("selected_files");
   if (selWidget) {
-    selWidget.serializeValue = () => JSON.stringify(state.selected);
-    selWidget.beforeQueued = () => { selWidget.value = JSON.stringify(state.selected); };
+    selWidget.serializeValue = () => currentSerialized();
+    selWidget.beforeQueued = () => { selWidget.value = currentSerialized(); };
   }
 
+  // 节点上的原始 combo 也保持双向同步
+  const selModeWidget = w("select_mode");
+  if (selModeWidget) {
+    const origCb = selModeWidget.callback;
+    selModeWidget.callback = function () {
+      if (origCb) origCb.apply(this, arguments);
+      setSelectMode(selModeWidget.value);
+    };
+  }
   const modeWidget = w("multi_mode");
   if (modeWidget) {
     const origCb = modeWidget.callback;
@@ -568,6 +741,44 @@ function buildPanel(node) {
       if (origCb) origCb.apply(this, arguments);
       updateStatus();
     };
+  }
+
+  /* 供全局 Run 拦截器使用的接口 */
+  const panelApi = {
+    node,
+    grid,                 // 容器尺寸变化时可手动校准
+    syncRowHeight,
+    getState: () => state,
+    getMode: execMode,
+    setOverride(v) {
+      state.override = v;
+      const sw = w("selected_files");
+      if (sw) sw.value = currentSerialized();
+    },
+    progress(done, total) {
+      state.runDone = done;
+      state.runTotal = total;
+      if (total > 0) {
+        setStatus(`循环执行中 ${done}/${total} · 每张图各跑一次完整工作流`, false, true);
+      } else {
+        updateStatus();
+      }
+    },
+  };
+  const key = node.id != null ? String(node.id) : "sg" + Math.random().toString(36).slice(2);
+  PANELS.set(key, panelApi);
+  const origRemoved = node.onRemoved;
+  node.onRemoved = function () {
+    PANELS.delete(key);
+    if (node.__sgRO) { try { node.__sgRO.disconnect(); } catch (e) {} }
+    return origRemoved ? origRemoved.apply(this, arguments) : undefined;
+  };
+
+  // 容器宽度变化时（列数变化）重新计算行高
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => syncRowHeight());
+    ro.observe(root);
+    node.__sgRO = ro;
   }
 
   restore();
@@ -580,7 +791,6 @@ function buildPanel(node) {
  * 决定，而 widget.width 常常在 widget 创建时按节点当时的默认宽度（约 210）
  * 缓存下来。之后节点被 setSize 拉宽、从工作流恢复尺寸、或面板内容重排触发
  * 重新布局，这个值都不会跟着更新 —— 面板就停在半宽，右边留一大块空白。
- * 这是新版前端的通用毛病，凡是带 DOM 面板的节点都会偶发。
  * 对策：让 widget.width 始终跟随节点真实宽度，并在启动初期校验覆盖层实际
  * 宽度，前端若仍算错就直接把容器撑开。
  */
@@ -594,9 +804,7 @@ function installWidthGuard(node, dw, root) {
   const sync = () => {
     const nw = targetWidth();
     if (!nw) return;
-    // 主修法：覆盖层宽度公式读的就是这个字段
     try { if (dw.width !== nw) dw.width = nw; } catch (e) { /* 只读属性则走兜底 */ }
-    // 部分版本还会拿 minNodeSize 参与布局计算（只在变化时写，避免每帧触发重排）
     const mns = dw.options && dw.options.minNodeSize;
     if (Array.isArray(mns) && mns[0] !== nw) {
       dw.options.minNodeSize = [nw, mns[1] || 560];
@@ -616,8 +824,6 @@ function installWidthGuard(node, dw, root) {
     return r;
   };
 
-  // 兜底：前端每帧会重写覆盖层的 inline width，若它仍按旧值算，就强行纠正
-  // 容器宽度（容器处在 transform:scale() 里，px 值用画布单位）。
   let ticks = 0;
   const timer = setInterval(() => {
     sync();
@@ -641,25 +847,24 @@ app.registerExtension({
   name: "Shanggu.WebImageGallery",
   async setup() {
     injectCSS();
-    installQueueFanout();
+    installRunLoop();
   },
   async nodeCreated(node) {
     const cls = node.comfyClass || (node.constructor && node.constructor.comfyClass) || node.type;
     if (cls !== NODE_TYPE) return;
     injectCSS();
     // 先定好最终尺寸，再创建 DOM widget，让覆盖层按 460 而不是默认 210 初始化
-    node.setSize([460, 660]);
+    node.setSize([460, 720]);
     const root = buildPanel(node);
     const dw = node.addDOMWidget("gallery_panel", "sg_gallery", root, {
       serialize: false,
       hideOnZoom: false,
-      getMinHeight: () => 480,
+      getMinHeight: () => 520,
     });
     dw.serialize = false;
-    // 0.45 新版前端用 computeLayoutSize / minNodeSize 计算 DOM widget 占位
-    dw.computeLayoutSize = () => ({ minHeight: 480, minWidth: 420 });
+    dw.computeLayoutSize = () => ({ minHeight: 520, minWidth: 420 });
     dw.options = dw.options || {};
-    dw.options.minNodeSize = [420, 560];
+    dw.options.minNodeSize = [420, 600];
     installWidthGuard(node, dw, root);
     node.setDirtyCanvas(true, true);
   },
