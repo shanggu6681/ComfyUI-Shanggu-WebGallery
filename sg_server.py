@@ -199,9 +199,20 @@ async def handle_fetch(request: web.Request) -> web.Response:
     else:
         s["next"] = None
     s["page"] = next_page_no
-    has_more = bool(s["next"]) and len(new) > 0
-    if not has_more:
+
+    # 滚动加载不能因为「这一页恰好 0 张新图」就永久停住：站点偶发重复、
+    # 限流或整页被去重时，下一页仍然有内容。只有连续 3 次空页才认定到底。
+    if not s["next"]:
         s["exhausted"] = True
+        s["empty_pages"] = 0
+    elif new:
+        s["empty_pages"] = 0
+    else:
+        s["empty_pages"] = int(s.get("empty_pages", 0)) + 1
+        if s["empty_pages"] >= 3:
+            s["next"] = None
+            s["exhausted"] = True
+    has_more = bool(s["next"])
 
     return web.json_response({
         "ok": True,
@@ -214,7 +225,8 @@ async def handle_fetch(request: web.Request) -> web.Response:
         "status": status,
         "effective_url": s["base"],
         "rewritten": rewritten,
-        "message": "" if new else "这一页没有发现新图片，已停止加载",
+        "message": "" if new else ("这一页没有新图片，继续尝试下一页…" if has_more
+                                   else "这一页没有发现新图片，已停止加载"),
     })
 
 
@@ -257,6 +269,31 @@ async def handle_parse(request: web.Request) -> web.Response:
 
 
 # --------------------------------------------------------------------------- #
+# /expand —— 点开检索页封面时取回该作品的同系列图片（SPA 站点专用）
+# --------------------------------------------------------------------------- #
+async def handle_expand(request: web.Request) -> web.Response:
+    import asyncio
+    try:
+        d = await request.json()
+    except Exception:
+        return _error("请求体不是合法 JSON")
+    wid = str(d.get("work_id") or "").strip()
+    if not wid:
+        return _error("缺少 work_id")
+    sid = str(d.get("session_id") or "default")
+    settings = _clean_settings(d.get("settings")) or get_session(sid).get("settings", {})
+    try:
+        items = await asyncio.wait_for(
+            adapters.expand(wid, settings, str(d.get("origin") or "")), timeout=25
+        )
+    except Exception as e:
+        return _error(f"展开失败: {type(e).__name__}: {e}")
+    if not items:
+        return _error("没有取到该作品的图片，站点可能暂时不可用")
+    return web.json_response({"ok": True, "items": items, "total": len(items)})
+
+
+# --------------------------------------------------------------------------- #
 # /thumb —— 缩略图代理（绕过防盗链 / CORS / 混合内容，并压缩到网格尺寸）
 # --------------------------------------------------------------------------- #
 async def handle_thumb(request: web.Request) -> web.Response:
@@ -269,6 +306,10 @@ async def handle_thumb(request: web.Request) -> web.Response:
         w = 320
     sid = request.query.get("session_id", "default")
     settings = _settings_for(url, get_session(sid).get("settings", {}), sid)
+    # 展开出来的同系列图片不在 session.items 里，前端把各自的 Referer 带过来
+    ref = str(request.query.get("referer") or "").strip()
+    if ref:
+        settings["referer"] = ref
     key = hashlib.sha1((url + "|" + str(w)).encode("utf-8")).hexdigest() + ".jpg"
     path = os.path.join(CACHE_DIR, key)
     if os.path.isfile(path):
@@ -313,6 +354,9 @@ async def handle_select(request: web.Request) -> web.Response:
     settings = _settings_for(
         url, _clean_settings(d.get("settings")) or get_session(sid).get("settings", {}), sid
     )
+    ref = str(d.get("referer") or "").strip()
+    if ref:
+        settings["referer"] = ref
 
     try:
         import folder_paths
@@ -399,7 +443,8 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True, "name": "ComfyUI-Shanggu-WebGallery", "version": "1.0.0",
         "sessions": len(SESSIONS), "input_dir": input_dir,
-        "endpoints": ["/sg_gallery/fetch", "/sg_gallery/parse", "/sg_gallery/thumb", "/sg_gallery/select"],
+        "endpoints": ["/sg_gallery/fetch", "/sg_gallery/parse", "/sg_gallery/expand",
+                      "/sg_gallery/thumb", "/sg_gallery/select"],
     })
 
 
@@ -422,6 +467,7 @@ def install_routes() -> None:
     routes.get("/sg_gallery/health")(handle_health)
     routes.post("/sg_gallery/fetch")(handle_fetch)
     routes.post("/sg_gallery/parse")(handle_parse)
+    routes.post("/sg_gallery/expand")(handle_expand)
     routes.get("/sg_gallery/thumb")(handle_thumb)
     routes.post("/sg_gallery/select")(handle_select)
     print("[ShangguWebGallery] HTTP 接口已注册: /sg_gallery/*")

@@ -7,6 +7,11 @@
 
     网页地址 -> 列表接口 -> 并发取每行详情 -> 拼出站点 CDN 的 webp 直链
 
+**两层显示**：该站检索页是「一个作品 = 一张封面」，点开作品才列出同系列的
+其它页图。适配器在抓列表时就把每个作品的全部图片缓存到 _GROUP_CACHE，
+但只把封面交给前端；前端点击封面时走 /sg_gallery/expand 取回同系列图片，
+插到封面后面。这样检索页的密度和站点一致，也不会一次性塞满网格。
+
 模块刻意只依赖 sg_scraper，不 import ComfyUI，方便单独跑测试。
 """
 from __future__ import annotations
@@ -28,6 +33,27 @@ AITAG_REFERER = "https://aitag.win/"
 PIXIV_REFERER = "https://www.pixiv.net/"
 
 _ASSET_CACHE: dict[str, Any] = {"url": "", "ts": 0.0}
+
+# work_id -> 该作品的全部图片（含封面）。检索页只显示封面，点开时才用。
+# 有上限的 FIFO，避免长时间抓取把内存撑大；缓存丢了也能按 id 现场重取。
+_GROUP_CACHE: dict[str, list[dict]] = {}
+_GROUP_ORDER: list[str] = []
+_GROUP_CACHE_MAX = 4000
+
+
+def _remember_group(wid: str, children: list[dict]) -> None:
+    if not wid or not children:
+        return
+    if wid not in _GROUP_CACHE:
+        _GROUP_ORDER.append(wid)
+    _GROUP_CACHE[wid] = children
+    while len(_GROUP_ORDER) > _GROUP_CACHE_MAX:
+        old = _GROUP_ORDER.pop(0)
+        _GROUP_CACHE.pop(old, None)
+
+
+def cached_group(wid: str) -> list[dict]:
+    return _GROUP_CACHE.get(str(wid or "").strip(), [])
 
 
 # --------------------------------------------------------------------------- #
@@ -238,15 +264,26 @@ async def _parse_aitag(data: Any, url: str, settings: dict, limit: int):
         detail = details.get(wid)
         images = detail.get("images") if isinstance(detail, dict) else None
         prompt = _prompt_of(row)
+        children: list[dict] = []
         if isinstance(images, list) and images:
             for img in sorted(images, key=lambda x: _page_index(str(x.get("file_name") or ""))):
                 u = _image_url(asset, img) if isinstance(img, dict) else ""
                 if u:
-                    items.append(_entry(u, row, AITAG_REFERER, prompt))
-        else:
+                    children.append(_entry(u, row, AITAG_REFERER, prompt))
+        if not children:
             # 详情接口偶发失败：退回 Pixiv 原图（体积大，但至少能出图）
             for u in _fallback_urls(row)[:1]:
-                items.append(_entry(u, row, PIXIV_REFERER, prompt))
+                children.append(_entry(u, row, PIXIV_REFERER, prompt))
+        if not children:
+            continue
+
+        # 只把封面交给检索页；同系列图片缓存起来，等用户点开再取
+        _remember_group(wid, children)
+        cover = dict(children[0])
+        cover["group_id"] = wid
+        cover["group_total"] = len(children)
+        cover["group_title"] = str(row.get("title") or "")
+        items.append(cover)
         if len(items) >= limit:
             break
 
@@ -261,6 +298,57 @@ async def _parse_aitag(data: Any, url: str, settings: dict, limit: int):
         nxt = sg.bump_query_param(url, "page", page + 1)
 
     return sg._finish(items, limit), nxt, "json"
+
+
+async def expand(work_id: str, settings: dict, origin: str = "") -> list[dict]:
+    """按作品 id 返回该作品的全部图片（含封面）。
+
+    优先用抓取列表时缓存的结果；缓存丢失（例如 ComfyUI 重启后从工作流
+    恢复了封面）就现场请求 /api/work/{id}，所以旧工作流也照样能点开。
+    """
+    wid = str(work_id or "").strip()
+    if not wid.isdigit():
+        return []
+    cached = cached_group(wid)
+    if cached:
+        return cached
+
+    # 前端传的是网址框里的整条地址（可能带 ?q= 或 /api/...），只取 origin
+    try:
+        p = urllib.parse.urlsplit(origin or "")
+        base = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else "https://aitag.win"
+    except Exception:
+        base = "https://aitag.win"
+    asset = await _asset_base(base, settings)
+    headers = sg.build_headers({**settings, "referer": base + "/"},
+                               f"{base}/api/work/{wid}", json_mode=True)
+    connector, proxy = sg._connector(settings)
+    try:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as sess:
+            async with sess.get(f"{base}/api/work/{wid}", proxy=proxy,
+                                timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+    except Exception:
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("images"), list):
+        return []
+
+    work = data.get("work") if isinstance(data.get("work"), dict) else {}
+    prompt = _prompt_of(work)
+    children: list[dict] = []
+    for img in sorted(data["images"],
+                      key=lambda x: _page_index(str(x.get("file_name") or ""))):
+        u = _image_url(asset, img) if isinstance(img, dict) else ""
+        if u:
+            children.append(_entry(u, work, AITAG_REFERER, prompt))
+    if not children:
+        for u in _fallback_urls(work)[:1]:
+            children.append(_entry(u, work, PIXIV_REFERER, prompt))
+    if children:
+        _remember_group(wid, children)
+    return children
 
 
 async def parse(url: str, text: str, settings: dict, limit: int):

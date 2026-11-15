@@ -13,7 +13,9 @@ const BASE = api.api_base || "";
 const EP = (p) => "/sg_gallery/" + p;
 const FULL = (p) => BASE + "/sg_gallery/" + p;
 const PRESET = "https://civitai.red/api/v1/images?limit=20";
-const MAX_TILES = 400;   // 无限滚动的 DOM 上限，防止几百张缩略图把前端拖垮
+// 检索页现在是「一个作品一张封面」，每页 60 张，这个上限约等于 25 页。
+// 以前把同系列图片全部摊平，每页 200 张，两页就撞满 400 导致滚动停摆。
+const MAX_TILES = 1500;
 
 /* 面板注册表：全局 Run 拦截器用它找到画布上处于「多图 + 多选」的图库节点 */
 const PANELS = new Map();
@@ -69,6 +71,16 @@ const CSS = `
 .sg-info{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.62);color:#ddd;
   font-size:9px;padding:1px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0}
 .sg-tile:hover .sg-info{opacity:1}
+/* 检索页封面 + 点开后紧挨着的同系列图片 */
+.sg-tile.sg-cover{cursor:zoom-in}
+.sg-group-count{position:absolute;left:2px;top:2px;max-width:calc(100% - 4px);
+  background:rgba(0,0,0,.72);color:#ffd479;font-size:9px;font-weight:700;
+  padding:0 4px;border-radius:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sg-tile.sg-expanded .sg-group-count{background:#1d6fc4;color:#fff}
+.sg-tile.sg-child{box-shadow:inset 3px 0 0 #e0a44a}
+.sg-collapse{position:absolute;right:2px;bottom:2px;z-index:2;cursor:pointer;
+  background:rgba(0,0,0,.78);color:#fff;font-size:9px;padding:1px 4px;border-radius:3px}
+.sg-collapse:hover{background:#c0392b}
 .sg-footer{display:flex;gap:4px;flex:none}
 .sg-footer button{flex:1;font-size:10.5px;padding:4px 2px}
 .sg-adv{flex:none;font-size:10.5px;max-height:150px;overflow:auto}
@@ -398,6 +410,7 @@ function buildPanel(node) {
   adv.appendChild(advGrid);
   const advHint = el("div", "sg-hint",
     "提示：输入 https://aitag.win/ 或 https://civitai.red/images 会自动切到同站 JSON 接口；" +
+    "aitag.win 的检索页每个作品只显示 1 张封面，点封面才在它后面紧挨着展开同系列图片，未点开的不显示；" +
     "网址下方的「18+」勾选框控制是否请求 aitag.win 的成人内容（默认开启）。" +
     "运行次数只看「单图 / 多图」：单图一次只跑 1 张；多图按点选顺序，每张图各提交一次独立运行，" +
     "队列里会依次出现 N 个任务，属正常现象。运行提交成功后会自动清空已选图片，可直接点下一批。");
@@ -415,11 +428,13 @@ function buildPanel(node) {
   const state = {
     sid: (node.properties.sg_session || ("sg" + Math.random().toString(36).slice(2, 10))),
     items: (node.properties.sg_items || []).slice(0, 600),
+    childItems: [],      // 已点开的同系列图片（只显示在封面后面，不算检索页条目）
     selected: [],
     selectedByUrl: new Map(),
     hasMore: false,
     loading: false,
     page: 0,
+    autoChained: 0,      // 滚动没被撑开时自动续拉的次数
     rewriteHint: "",
     truncated: false,
     override: null,      // 循环执行期间临时写入 prompt 的单张 JSON
@@ -492,6 +507,7 @@ function buildPanel(node) {
       : `每张各运行 1 次(共 ${Math.max(1, state.selected.length)} 次)`;
     setStatus(
       `已加载 ${state.items.length} 张 · 已选 ${state.selected.length} 张 · ${sm} · ${run}` +
+      (state.childItems.length ? " · 已展开 " + state.childItems.length + " 张同系列" : "") +
       (state.hasMore ? " · 向下滚动继续加载" : "") +
       (state.truncated ? " · 已达显示上限" : "") + state.rewriteHint
     );
@@ -529,32 +545,126 @@ function buildPanel(node) {
     });
   }
 
-  function appendItems(items) {
-    for (const it of items) {
-      if (!it || !it.url) continue;
-      if (state.items.some((x) => x.url === it.url)) continue;
-      if (grid.children.length >= MAX_TILES) { state.truncated = true; break; }
-      state.items.push(it);
-      const tile = el("div", "sg-tile");
-      tile.dataset.url = it.url;
-      tile.title = (it.title || "") + (it.prompt ? "\n" + it.prompt.slice(0, 200) : "");
-      const img = el("img");
-      img.loading = "lazy";
-      img.src = FULL("thumb?session_id=" + encodeURIComponent(state.sid) +
-                     "&w=320&url=" + encodeURIComponent(it.thumb || it.url));
-      img.onerror = () => {
-        img.remove();
-        tile.classList.add("sg-broken");
-        tile.textContent = "缩略图加载失败\n(原图仍可点选)";
-      };
-      tile.appendChild(img);
-      if (it.title || it.width) {
-        tile.appendChild(el("div", "sg-info",
-          (it.title ? it.title + "  " : "") + (it.width ? it.width + "×" + it.height : "")));
+  /** 造一个缩略图格子。
+   *  it.group_id 存在时是检索页封面（点击 = 展开同系列）；
+   *  opts.child 时是展开出来的同系列图片（点击 = 正常点选）。 */
+  function makeTile(it, opts = {}) {
+    const tile = el("div", "sg-tile");
+    tile.dataset.url = it.url;
+    const gid = opts.child ? "" : (it.group_id || "");
+    const total = Number(it.group_total || 0);
+    tile.title = (it.title || "") + (it.prompt ? "\n" + it.prompt.slice(0, 200) : "") +
+      (gid && total > 1 ? "\n▸ 点击展开这个作品的其余 " + (total - 1) + " 张图" : "");
+    const img = el("img");
+    img.loading = "lazy";
+    const ref = it.referer ? "&referer=" + encodeURIComponent(it.referer) : "";
+    img.src = FULL("thumb?session_id=" + encodeURIComponent(state.sid) +
+                   "&w=320&url=" + encodeURIComponent(it.thumb || it.url)) + ref;
+    img.onerror = () => {
+      img.remove();
+      tile.classList.add("sg-broken");
+      tile.textContent = "缩略图加载失败\n(原图仍可点选)";
+    };
+    tile.appendChild(img);
+    if (it.title || it.width) {
+      tile.appendChild(el("div", "sg-info",
+        (it.title ? it.title + "  " : "") + (it.width ? it.width + "×" + it.height : "")));
+    }
+    if (gid) {
+      tile.classList.add("sg-cover");
+      tile.dataset.group = gid;
+      tile.dataset.total = String(total);
+      if (total > 1) tile.appendChild(el("div", "sg-group-count", "1/" + total + " 张"));
+      tile.onclick = () => onCoverClick(it, tile);
+    } else {
+      if (opts.child) {
+        tile.classList.add("sg-child");
+        tile.dataset.groupChild = opts.groupId || "";
       }
       tile.onclick = () => toggleSelect(it);
-      grid.appendChild(tile);
     }
+    return tile;
+  }
+
+  function appendItems(items, opts = {}) {
+    for (const it of items) {
+      if (!it || !it.url) continue;
+      if (!opts.fromRestore && state.items.some((x) => x.url === it.url)) continue;
+      if (state.items.length >= MAX_TILES) { state.truncated = true; break; }
+      state.items.push(it);
+      grid.appendChild(makeTile(it));
+    }
+    syncRowHeight();
+    refreshBadges();
+    updateStatus();
+  }
+
+  /** 点检索页封面：把该作品其余图片紧挨着插到封面后面，未点开的作品保持折叠。 */
+  async function onCoverClick(it, tile) {
+    if (tile.dataset.expanded === "1" || !it.group_id || Number(it.group_total || 0) <= 1) {
+      // 已展开 / 普通图 / 单图作品：就是普通的点选，不必请求展开
+      await toggleSelect(it);
+      return;
+    }
+    if (tile.dataset.expanding === "1") return;
+    const gid = String(it.group_id);
+    tile.dataset.expanding = "1";
+    setStatus("正在展开这个作品的全部图片…");
+    let children = Array.isArray(it.children) ? it.children : [];
+    if (!children.length) {
+      try {
+        const r = await postJSON(EP("expand"), {
+          work_id: gid, session_id: state.sid,
+          settings: collectSettings(), origin: (urlInput.value || "").trim(),
+        });
+        if (!r.ok) {
+          setStatus(r.error || "展开失败", true);
+          tile.dataset.expanding = "";
+          return;
+        }
+        children = r.items || [];
+      } catch (e) {
+        setStatus("展开失败: " + e, true);
+        tile.dataset.expanding = "";
+        return;
+      }
+    }
+    tile.dataset.expanding = "";
+    const rest = children.filter((c) => c && c.url && c.url !== it.url);
+    if (rest.length) {
+      const anchor = tile.nextSibling;   // 一直插到同一个锚点前 => 顺序与作品页一致
+      for (const c of rest) {
+        if (grid.children.length >= MAX_TILES + 600) break;
+        grid.insertBefore(makeTile(c, { child: true, groupId: gid }), anchor);
+        state.childItems.push(c);
+      }
+      tile.dataset.expanded = "1";
+      tile.classList.add("sg-expanded");
+      const badge = tile.querySelector(".sg-group-count");
+      if (badge) badge.textContent = "共 " + children.length + " 张";
+      const btn = el("div", "sg-collapse", "× 收起");
+      btn.onclick = (e) => { e.stopPropagation(); collapseGroup(tile, gid); };
+      tile.appendChild(btn);
+    }
+    syncRowHeight();
+    refreshBadges();
+    // 保留原来的习惯：点一下就把这张封面载入工作流，同时展开同系列供挑选
+    await toggleSelect(it);
+  }
+
+  function collapseGroup(tile, gid) {
+    [...grid.children].forEach((n) => {
+      if (n.dataset && n.dataset.groupChild === gid) {
+        state.childItems = state.childItems.filter((x) => x.url !== n.dataset.url);
+        n.remove();
+      }
+    });
+    tile.dataset.expanded = "";
+    tile.classList.remove("sg-expanded");
+    const badge = tile.querySelector(".sg-group-count");
+    if (badge) badge.textContent = "1/" + (tile.dataset.total || "?") + " 张";
+    const btn = tile.querySelector(".sg-collapse");
+    if (btn) btn.remove();
     syncRowHeight();
     refreshBadges();
     updateStatus();
@@ -573,6 +683,7 @@ function buildPanel(node) {
     try {
       const r = await postJSON(EP("select"), {
         url: it.url, session_id: state.sid, settings: collectSettings(),
+        referer: it.referer || "",
       });
       if (!r.ok) { setStatus("下载失败: " + (r.error || "未知错误"), true); return; }
       const entry = {
@@ -594,6 +705,10 @@ function buildPanel(node) {
     }
   }
 
+  function nearGridBottom() {
+    return grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 160;
+  }
+
   async function doFetch(reset) {
     if (state.loading) return;
     if (!reset && (!state.hasMore || state.truncated)) return;
@@ -602,8 +717,10 @@ function buildPanel(node) {
     if (reset) {
       grid.innerHTML = "";
       state.items = [];
+      state.childItems = [];
       state.hasMore = true;
       state.page = 0;
+      state.autoChained = 0;
       state.truncated = false;
     }
     setStatus("正在抓取网页…");
@@ -632,6 +749,14 @@ function buildPanel(node) {
       state.loading = false;
       btnMore.disabled = false;
     }
+    // 这一页没能撑长滚动条时，浏览器不会再发 scroll 事件，无限滚动就
+    // 卡死在底部了（整页被去重 / 接口偶发空页都会这样）。主动再拉几页。
+    if (!reset && state.hasMore && !state.truncated && nearGridBottom()) {
+      state.autoChained += 1;
+      if (state.autoChained <= 12) setTimeout(() => doFetch(false), 80);
+    } else {
+      state.autoChained = 0;
+    }
   }
 
   async function doParse() {
@@ -648,7 +773,7 @@ function buildPanel(node) {
       });
       if (!r.ok) { setStatus(r.error || "解析失败", true); return; }
       if (!appendChk.checked) {
-        grid.innerHTML = ""; state.items = []; state.truncated = false;
+        grid.innerHTML = ""; state.items = []; state.childItems = []; state.truncated = false;
       }
       appendItems(r.items || []);
       state.hasMore = false;
@@ -660,7 +785,8 @@ function buildPanel(node) {
   }
 
   grid.addEventListener("scroll", () => {
-    if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 160) doFetch(false);
+    state.autoChained = 0;         // 用户真的滚动了，续拉计数重新开始
+    if (nearGridBottom()) doFetch(false);
   });
 
   function rememberUrl(value) {
@@ -718,7 +844,7 @@ function buildPanel(node) {
   btnAll.onclick = async () => {
     // 「全选可见」隐含多选意图，自动切到多图模式
     if (selectMode() === SEL_SINGLE) setSelectMode(SEL_MULTI);
-    for (const it of state.items) {
+    for (const it of state.items.concat(state.childItems)) {
       if (grid.children.length >= MAX_TILES && state.truncated) break;
       if (!state.selectedByUrl.has(it.url)) await toggleSelect(it);
     }
@@ -761,9 +887,13 @@ function buildPanel(node) {
       const sw0 = w("selected_files");
       if (sw0) sw0.value = JSON.stringify(state.selected);
     }
-    state.items = (node.properties.sg_items || []).slice(0, 600);
+    // 从工作流恢复时先清空 items，否则 appendItems 的去重会把它们全跳过，
+    // 网格会变成空白；封面只存 group_id，点开时由 /expand 现场取回同系列。
+    const savedItems = (node.properties.sg_items || []).slice(0, 600);
+    state.items = [];
+    state.childItems = [];
     grid.innerHTML = "";
-    appendItems(state.items);
+    appendItems(savedItems, { fromRestore: true });
     syncModeButtons();
     updateStatus();
   }
