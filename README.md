@@ -12,7 +12,7 @@
 - **点选即加载**：被点中的原图由后端下载到 ComfyUI 的 `input/` 目录并做本地缓存，节点输出标准 `IMAGE` / `MASK`，等价于内置「加载图像」节点，可以直接接给 VAE 编码、img2img、IP-Adapter 等。
 - **一个开关决定一切**：只有「单图 / 多图」这一个开关。单图「点哪个换哪个」，运行 1 次；多图累加多选并按编号顺序，每张图各运行 1 次。
 - **真正的循环执行**：多图模式下一次运行被拆成 N 个独立 prompt，每张图各跑一遍完整下游工作流。
-- **顺手拿到页面信息**：`info_json` 输出原图网址、文件名、尺寸以及页面上抓到的 prompt 等字段，配套的「图库信息提取」节点可以把其中某个字段拆成文本，接给 CLIP 文本编码。
+- **顺手拿到页面信息**：`info_json` 输出原图网址、文件名、尺寸以及页面上抓到的 prompt 等字段。
 
 ---
 
@@ -50,7 +50,6 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | 站点兜底 | Cookie / UA / Referer / HTTP 或 SOCKS5 代理、自定义正则、粘贴源码、浏览器桥接书签 |
 | 尺寸统一 | 等比缩放+填充、居中裁剪、直接拉伸、保持原尺寸（默认统一到 1024×1024，避免网页原图过大撑爆显存） |
 | Qwen 扩图草图（推荐首选） | `ShangguQwenOutpaintDraft`：源图 + 目标比例 → 低像素 16:9 草图。内部一条链搞定：去黑边 → 灰底画布(#808080) → Qwen2.1 文本编码器看图 → outpaint LoRA 全图重绘（**不用 mask、无接缝、不多手脚**）。拿草图再去跑 MOSS 出最终图 |
-| 角色参考整图重绘 | `ShangguCharRefScene`：MOSS 模型 + 原图人物当参考 + 场景提示词 → 整图从头生成。仅适用于 MOSS 模型 |
 
 ---
 
@@ -61,7 +60,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
    ComfyUI/custom_nodes/ComfyUI-Shanggu-WebGallery/
    ```
 2. 重启 ComfyUI（或浏览器 **Ctrl+F5** 强制刷新，扩展 JS 是动态扫描的）。
-3. 双击画布搜索 **Qwen扩图草图→IMAGE**（`ShangguQwenOutpaintDraft`，竖图转横图首选）、**网页图库选图器**（`ShangguWebImageGallery`）、**角色参考整图重绘**（`ShangguCharRefScene`，MOSS 专用）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
+3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）和 **Qwen扩图草图→IMAGE**（`ShangguQwenOutpaintDraft`，竖图转横图首选）。本插件只有这两个节点；节点若没出现，重启一次 ComfyUI 即可。
 
 无需 `pip install`：核心依赖 `aiohttp`、`PIL`、`numpy`、`torch` 都是 ComfyUI 自带的。
 
@@ -111,10 +110,6 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 - `multi_mode` 是早期「逐张 / 批量」留下的**隐藏占位参数**，值被完全忽略，保留它只是为了让老工作流的 `widgets_values` 顺序不错位；前端会把它隐藏，你不会在节点上看到它。
 - 多图模式如果一个 prompt 里意外收到 2 张以上（说明前端扩展没加载或工作流里有第二个多图节点），节点会明确报错而不是悄悄退化成批次，按提示 **Ctrl+F5 强制刷新**即可。
 
-### 图库信息提取 `ShangguGalleryInfo`
-
-把 `info_json` 里指定字段（如 `prompt`、`url`）按索引拆成 `STRING`，方便直接接文本编码节点做「看图写提示词」。
-
 ### Qwen 扩图草图 `ShangguQwenOutpaintDraft`（竖图转横图首选）
 
 **把 9:16 竖图变成 16:9 横图、人物完整不变形、左右是自然场景——一个节点直接出草图。** 内部封装了 ausboss `Qwen-Image-2.1-Outpaint-LoRA` 的官方全链路，你只接一张图 + 选目标比例即可，不用自己搭十几个节点。
@@ -125,7 +120,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 图库选图器 / LoadImage
    └─ image → Qwen扩图草图 (Shanggu)
                 ├─ draft     → SaveImage（低像素草图，长边默认 768）
-                ├─ reference → PreviewImage（灰底参考图，调试用）
+                ├─ reference → PreviewImage（生成后的扩图草图，与 draft 同一张）
                 └─ info      → （尺寸/比例明细 JSON）
 ```
 
@@ -149,187 +144,6 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 - 模型文件名都是下拉可选，默认已选中本机确认存在的版本；如果你的文件名不同，下拉里改即可
 
 **前置条件**：本地需有上面的 Qwen2.1 模型 + 画面扩展 outpaint LoRA（你的环境已齐全）。这一步产出的是**低像素草图**，最终的清晰度、风格由后面的 MOSS 工作流负责——两者分工，各用其所长。
-
----
-
-### 图像扩图→Latent `ShangguImageExpandToLatent`
-
-一个节点**代替「缩放图像 + VAE 编码」**，专门解决「竖屏原图要生成横屏图」的问题。老的缩放节点只有两条路：居中裁切（只剩中间一条、主体丢失）或直接拉伸（变形、两侧黑框），都出不了满屏的横屏图。本节点走标准 outpainting：
-
-```
-原图(可竖屏) → 自动去掉源图自带的黑边 → 可选裁切上下 → 等比缩放(不拉伸)
-            → 高度贴合、左右扩图 → 扩展区写进 mask → VAE 编码成带 noise_mask 的 latent
-            → KSampler 按文本只补扩展区，原图部分原样保留
-```
-
-> **关于黑边**：图库下载的图常被 pad 成 9:16，四周自带一圈纯黑/纯白边。这圈边如果留在"原图保留区"（mask=0），采样器根本不会重绘它，成图就会带着黑条。节点默认开启 **`trim=自动去黑边`**，在缩放前先把这种"整条边几乎全是极黑/极白"的 padding 裁掉；判定很严格（要求 99% 像素一致、灰阶、亮度 <18 或 >238），暗色/夜景照片不会被误裁。如遇特殊构图需保留，选 `不去黑边` 即可。
-
-| 输出 | 类型 | 说明 |
-| --- | --- | --- |
-| `latent` | `LATENT` | 带 `noise_mask`：**直接接 KSampler 的 `latent_image`**，扩展区会被文本补全 |
-| `expanded_image` | `IMAGE` | 扩好图后的画布（扩展区是底色），可接 PreviewImage 看构图 |
-| `expand_mask` | `MASK` | 扩展区为白（要重绘）、原图区为黑（保留） |
-| `info` | `STRING` | 原图尺寸、目标尺寸、裁切量、贴入位置、扩展像素数 |
-
-主要输入：
-
-| 输入 | 默认 | 作用 |
-| --- | --- | --- |
-| `image` / `vae` | — | 输入图（可来自图库节点或 LoadImage）与编码用的 VAE（要和采样模型匹配） |
-| `aspect` | `16:9` | 目标比例：16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 9:16 / 2:1 / 21:9 / 自定义 |
-| `long_side` | 1024 | 目标长边像素；短边按比例算并对齐到 8 的倍数 |
-| `vertical_crop` | 0.0 | **从原图上下各裁掉的比例**。`0`=整张保留、左右扩最多；`0.1~0.2`=轻微裁切、人像更宽；越大主体越突出。节点会自动限制上限，保证裁完仍"高度贴合、左右扩图"，不会出现上下留空或把图压扁 |
-| `position` | 居中 | 原图贴在画布的位置（居中/偏左/偏右/偏上/偏下） |
-| `fill` | 中性灰 | 扩展区底色，中性灰是 inpaint 标准、latent 编码最稳 |
-| `mask_grow` | 8 | mask 向原图内侧膨胀几像素，让接缝更自然；0=不膨胀 |
-| `trim` | 自动去黑边 | **自动裁掉源图自带的纯黑/纯白 padding 边**（黑边元凶）；特殊构图可选 `不去黑边` |
-
-**几何规则（保证不出黑边）**：源图先去黑边，再按 `vertical_crop` 裁上下，然后**固定"高度贴合画布"**等比缩放（不拉伸）。竖图 9:16 扩 16:9 时，人像宽度占比随裁切变化：`crop=0` 约 32%、`0.1` 约 40%、`0.2` 约 53%、`0.3` 约 79%——**任何设置下上下都零留空**，只有左右是扩图区。
-
-用法：把 `latent` 接 KSampler 的 `latent_image`，positive 写你想扩出来的内容（如「延续的画面、背景、天空」），**denoise 建议 0.9~1.0**（太低会补不满扩展区）。要更干净的接缝，可在前面接 `InpaintModelConditioning`。竖图扩横屏时选 `16:9` + `vertical_crop=0`（完整保留、左右补），或 `vertical_crop=0.1~0.2`（轻微裁上下、人像更充盈、少扩一点）——这就是你要的「裁切上下一小部分或不裁切，再不拉伸地左右扩图」。如果成图还有黑条，先看 `expanded_image` 输出：若那里就有黑条，说明是源图 padding，`trim` 没识别时可手动裁源图或选纯色更接近的填充。
-
-> 本节点输出的是 latent，**不是** IMAGE，因此它放在 VAE 编码那一步的位置，用不到也请删掉原来的「缩放图像 / VAE Encode」，别重复接线。
-
-#### 多手脚 / 接缝衔接（重要，别再走弯路）
-
-扩图最常见的两个毛病，成因不同、解法也不同：
-
-| 毛病 | 成因 | 解法 |
-| --- | --- | --- |
-| 扩出来**多一套手脚或多一个人** | 提示词描述了人物；或原图断肢正贴在 mask 边界，模型按「肢体从这里延伸」的先验去补全 | **提示词只写背景 + 负面词压人物**；`mask_grow` 调小 |
-| 原图和扩展区之间有**硬边 / 色差** | 两区分别生成，交界没融合 | 第二步**整体低 denoise 融合** |
-
-**第一步：只让扩展区生长背景**
-
-positive（只写环境，**绝不写人物**）：
-```
-seamless background continuation, sky, ocean, natural lighting, consistent color grading, film grain, highly detailed
-```
-把 `sky, ocean` 换成你原图的实际场景（街道 / 森林 / 室内）。
-
-negative（重点是压住人物和肢体）：
-```
-person, people, human, man, woman, child, face, body, hands, feet, arms, legs, fingers, extra limbs, duplicated limbs, extra people, character, figure, watermark, text
-```
-
-- `mask_grow`：默认 `8` → 改 **`2~4`**。膨胀太大会让模型改动到原图边缘的断肢，直接触发「续写第二只手」。
-- denoise 用 **`1.0`**：扩展区是从噪声全新生成的，低了补不满。
-- 这一步原图区 `mask=0` 完全不参与扩散，扩展区只长背景 → **不会有多手脚**。
-
-**第二步（可选）：整体轻融合消接缝**
-
-把第一步的 `VAEDecode` 结果接回 `VAEEncode`，再进第二个 KSampler：
-- positive 写完整描述（人物 + 背景）；negative 常规负面词 + `extra limbs, extra hands, duplicated people`
-- **denoise `0.3~0.4`**：让接缝柔和、色调统一，人物只轻微变化
-- 如果这一步又冒出手脚（denoise 让原图区也参与了），降到 `0.25`，或干脆跳过第二步只用第一步的结果
-
-**再补一招：先别让断肢贴边**
-
-如果原图边缘就是被截断的手 / 脚（尤其贴着左右边），模型必然从断口续写。用 `vertical_crop=0.1~0.2` 先把上下断肢裁掉再扩，或选图时避开这种构图——**断肢不在边缘，模型就没有续写的入口**。
-
-### 角色参考整图重绘 `ShangguCharRefScene`（多手脚 / 边缘不和谐的终极解法）
-
-> **这是目前效果最好的方案，优先用这个。** 上面那个 `图像扩图→Latent`（mask 扩图）会出现多手脚、接缝、边缘不和谐——这是 mask 架构的先天缺陷：模型不知道哪是人、哪是背景，只看到断掉的皮肤像素，就按统计规律往外续写第二只手。调填充色、denoise、mask_grow 都只是缓解，治不了根。
-
-本节点**彻底丢掉 mask**：把整张图从头生成，人物身份由 CharRef LoRA 锁住，场景由你的提示词决定。**没有「原图区 / 扩展区」之分，所以根本没有接缝这个概念。**
-
-配合你的工作流：用 Qwen 看图写出场景提示词 → 贴进本节点 → 接 KSampler，一步出 16:9 成图。
-
-**节点做的事**（全部封装，你不用管）：
-1. 原图自动去黑边、缩放到参考尺寸（`ref_max_side`，16GB 建议 768）
-2. 自动加载 `charref` 角色参考 LoRA（列表里已排最前，默认选中）
-3. 用 ComfyUI 内置 `TextEncodeMOSSImageEdit` 把参考图编成 latent + 视觉 token，并在提示词前自动加触发句 `Same character and art style as Picture 1.`
-4. negative 按 CharRef 规定用同一个编码器 + 空提示词
-5. 输出 `16:9`（边长对齐 16，MOSS 要求）的空 latent
-
-**接线（就这么几根）：**
-
-```
-LoadImage / 图库节点 ── image ──┐
-Load Diffusion Model(moss) ── model ──┤
-Load CLIP(qwen3.5, 类型 moss_image) ── clip ──┤
-Load VAE(flux2-vae) ── vae ──┤
-                              ↓
-                    角色参考整图重绘 (Shanggu)
-                      prompt = 你的场景提示词
-                      model / positive / negative / latent
-                              ↓ 分别接四根
-                     KSampler（denoise = 1.0！）
-                              ↓
-                     VAEDecode → SaveImage
-```
-
-**参数要点：**
-
-| 输入 | 默认 | 作用 |
-| --- | --- | --- |
-| `prompt` | 示例句 | Qwen 看图写的场景描述；`auto_prefix` 会自动补触发句，不用你手写 |
-| `charref_lora` | 自动选中 charref | 角色一致性 LoRA，找不到会提示 |
-| `lora_strength` | 1.0 | 人物不像可加到 1.2~1.4 |
-| `image_strength` | 1.0 | 参考图权重，越大越像原图人物；>1 会强化 |
-| `aspect` / `long_side` | 16:9 / 1024 | 成图比例与长边；显存紧保持 1024 |
-| `ref_max_side` | 768 | 参考图最长边；越小越省显存、身份细节略少 |
-| `trim` | 自动去黑边 | 去掉源图自带的黑边 |
-
-**关键提醒：**
-- **KSampler 的 denoise 必须是 `1.0`**——整图从头生成，调低反而会出怪图
-- 采样用 MOSS 官方参数：50 步 / CFG 3 / euler + sgm_uniform / SkipLayerGuidance 第 22 层
-- 一次只锁一个人物（Picture 1）；CharRef v2 偏动漫 / 插画，写实照片的脸保持会弱一些
-- 依赖 ComfyUI ≥ 0.43（内置 `TextEncodeMOSSImageEdit`），你的 0.45 已满足
-
-如果人物不像，优先调 `lora_strength`（1.0→1.3）和 `image_strength`（1.0→1.5），并在提示词里补几个外貌词（发色、眼睛颜色、关键服装）。
-
-### 图像重绘准备→Latent img2img `ShangguImagePrepForImg2Img`
-
-> **先读这段再决定用哪个节点。** 如果你的目标是「9:16 竖图 → 16:9 横图，人物要保留，左右两侧生成自然背景」，**优先用上面的 `角色参考整图重绘`**；只有当你要的是「保留原图像素、只整体轻微重绘」时才考虑本节点。
->
-> 原因（MOSS 上实测）：`denoise` 不是"重绘百分比"，而是"从噪声调度表哪一层起步"。
-> - denoise 低（0.2~0.4）：起始噪声太低 → 几乎等于 VAE 重建，**你填什么底色，成图就原样出什么**（边缘拉伸出条纹、模糊出模糊）。
-> - denoise 高（0.5+）：起始噪声太高 → 原图 latent 被淹没，模型照着提示词重画（人物图变成公交站台）。
->
-> 中间**没有**"模型自动理解填充区并续绘成背景"的档位——模型看不到"哪块是填充区"，它只看到一堆 latent。所以换填充方式（拉伸/模糊/镜像）解决不了问题。
-> **带 mask 的扩图节点才能解决**：它输出 `noise_mask`，原图区 mask=0 完全不参与扩散（人物像素级保留），扩展区 mask=1 从噪声全新生成，填充区底色长什么样根本不重要。
->
-> **本节点只适合**：SDXL / Flux 这类 img2img 训练充分的模型，或你确实想整图风格化重绘、不需要保留原图内容的场景。
-
-给「**大致保持人物和风格、动作可变、尺寸达标就行**」的重绘需求用。它和上面的扩图节点是**两个完全不同的东西**，别混：
-
-| | 图像扩图→Latent | 图像重绘准备→Latent（本节点） |
-| --- | --- | --- |
-| 目标 | 补出新区域，原图像素一动不动 | 整张重绘成新图，人物/风格大致保持 |
-| mask | 带 `noise_mask`，只重绘灰边 | **不带 mask**，整图按 denoise 重绘 |
-| denoise | 0.9~1.0（要补满灰边） | **MOSS 完整保留+模糊背景：0.35~0.45；cover：0.18~0.30；SDXL/Flux：0.4~0.6**（MOSS 超过 0.5 会被文字带跑，人物变场景） |
-| 尺寸 | 高度贴合、左右补灰 | **默认整图完整保留（一个像素不裁）+ 左右边缘延展；可选铺满裁切** |
-
-工作流只有一条链：
-
-```
-图库节点(或LoadImage) → 本节点(aspect / long_side) → KSampler(latent_image, MOSS denoise 0.22) → VAEDecode → SaveImage
-```
-
-- **`fit` 默认 `完整保留(内容不裁切,推荐)`**：整图等比缩放后完整可见，**一个像素都不裁**。9:16 竖图转 16:9 时，人物只占中间约 32% 宽，两侧空区由 `pad` 填充——这就是你要的"重绘但不缺内容"。
-- **`pad` 默认 `模糊背景(推荐)`**：整图放大后强高斯模糊铺满画布，再把清晰原图贴回中间。左右是原图色彩的柔和模糊、没有直线条纹也没有硬边，模型在 denoise 0.35~0.45 下会把它续绘成真实背景，中间清晰人像作锚点。
-  - `镜像填充`：左右镜像原图，纹理连续但可能出现对称重影；
-  - `边缘延展(会拉伸)`：把最边缘一列像素横向拉满——**会产生直线拉伸条纹，模型低 denoise 下原样保留，不推荐**；
-  - `中性灰/黑/白`：纯色填充，容易在交界处画出硬矩形。
-- `裁切填满(无留白,会裁上下)`：等比放大铺满、按 `position` 裁掉多余部分，画布无空边但**会切掉原图上下内容**——竖图转横图时人物可能只剩中间一条，只在你明确要铺满且接受裁切时才用。
-- `size_multiple` 默认 **16**——**MOSS-Image 要求边长是 16 的倍数**，直接用默认即可；SDXL / Flux / H3 用 8 或 16 都兼容。
-- 输出 `latent` **不带 `noise_mask`**，所以 KSampler 的 denoise 直接控制整图重绘强度；`prepared_image` 可接 PreviewImage 先看裁切构图对不对。
-
-**关于 MOSS**：MOSS-Image 本体是纯文生图，**原生不认参考图**（模板里的 `ref_image` 只喂给可选的 prompt enhancer，模型读不到图像内容）。所以要"看着原图重绘"就必须走本节点的 img2img 通道，让原图 latent 当构图+风格底子。MOSS 采样建议：**50 steps / CFG 3 / euler + sgm_uniform / shift 5（ModelSamplingAuraFlow multiplier 1）/ skip layer guidance layer 22**，VAE 用 `flux2-vae`。显存方面 int8 主模型约 5.4GB + Qwen3.5 文本编码器约 7.3GB，16GB 卡能跑但较紧。
-
-#### 排查：人物图被画成别的场景（例如公交站台）
-
-MOSS 是文生图模型，img2img 时**文字的牵引远强于 latent**。denoise 一高，起始 sigma 已经接近纯噪声，原图 latent 几乎不起作用，模型就照着提示词重画一个新场景。按这个顺序排查：
-
-1. **`prepared_image` 接 PreviewImage**：先确认节点输出的图里人物完整。竖图 9:16 → 16:9 必须用 `fit=完整保留(内容不裁切,推荐)`（默认值），整图一个像素不裁；若误选了 `裁切填满`，只会保留中间约 31% 高度，人物会被切掉大半——这就是"内容缺失"的根因。
-2. **denoise 用 0.35~0.45**（完整保留+模糊背景模式）：低于 0.35 模糊区续绘不出来、留有雾感；高于 0.5 人物会被文字带跑变成别的场景。用 cover 铺满整图重绘时才用 0.18~0.30。
-3. **确认 KSampler 接的是本节点的 `latent`**，不是 `EmptyLatentImage`，也不是旧「扩图→Latent」的输出。
-4. **提示词里明确写人物**：以 `同一人物，同样的服装和发型，` 开头再写场景；负面提示词加 `different person, no person, change character, bus stop, billboard`（把不想要的具体场景词也写进去）。
-5. **VAE 必须是 `flux2-vae`**（或官方配套的小 VAE）；用错 VAE 会让 latent 编码失效，表现同样是"完全看不出原图"。
-6. 仍不行就先跑通纯文生图基线（官方工作流、1024×1024、denoise 1），确认模型/采样器本身正常，再换回本节点。
-
-> 想要更强的"人物长得像"、跨场景保持同一角色，可以另装社区方案 `MOSS-Image CharRef v2`（edit LoRA + ostris 的 edit 节点，参考图接 `image1`，提示词以 `Same character and art style as Picture 1.` 开头）。但那要额外下 LoRA 和节点，且对"动作可 free 调整"的需求来说，本节点 + 合适 denoise 通常已经够用。
 
 ---
 
@@ -439,7 +253,7 @@ MOSS 是文生图模型，img2img 时**文字的牵引远强于 latent**。denoi
 | `GET /sg_gallery/thumb` | 缩略图代理 + 磁盘缓存 |
 | `POST /sg_gallery/select` | 下载选中原图到 `input/` 并返回文件名与尺寸；同 URL 只下载一次 |
 
-> 源码文件统一用 `sg_` 前缀命名（`sg_nodes.py` / `sg_server.py` / `sg_scraper.py` / `sg_adapters.py` / `sg_outpaint.py`），避免自定义节点目录进入 `sys.path` 后遮蔽 ComfyUI 内建的 `nodes` / `server` 模块。
+> 源码文件统一用 `sg_` 前缀命名（`sg_nodes.py` / `sg_qwen_outpaint.py` / `sg_server.py` / `sg_scraper.py` / `sg_adapters.py`），避免自定义节点目录进入 `sys.path` 后遮蔽 ComfyUI 内建的 `nodes` / `server` 模块。
 
 ---
 

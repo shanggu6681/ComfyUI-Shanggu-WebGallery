@@ -228,41 +228,9 @@ class ShangguWebImageGallery:
         )
 
 
-class ShangguGalleryInfo:
-    """把主节点的 info_json 拆成可直接接给文本编码 / 保存节点的字符串。"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "info_json": ("STRING", {"default": "[]", "multiline": True, "forceInput": True}),
-                "field": (["prompt", "filename", "url", "id", "全部(JSON)"],),
-                "index": ("INT", {"default": 0, "min": 0, "max": 9999}),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-    FUNCTION = "pick"
-    CATEGORY = "image/Shanggu 网页图库"
-
-    def pick(self, info_json, field, index):
-        try:
-            data = json.loads(info_json or "[]")
-        except Exception:
-            data = []
-        if field == "全部(JSON)":
-            return (json.dumps(data, ensure_ascii=False),)
-        if not isinstance(data, list) or index >= len(data):
-            return ("",)
-        return (str(data[index].get(field, "") or ""),)
-
-
 NODE_CLASS_MAPPINGS = {
     "ShangguWebImageGallery": ShangguWebImageGallery,
-    "ShangguGalleryInfo": ShangguGalleryInfo,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ShangguWebImageGallery": "网页图库选图器 (Shanggu)",
-    "ShangguGalleryInfo": "图库信息提取 (Shanggu)",
 }

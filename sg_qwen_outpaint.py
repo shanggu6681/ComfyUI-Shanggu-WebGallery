@@ -15,7 +15,7 @@
 outpaint LoRA 训练目标就是「灰色区补全、原图区不动」，全图重绘反而没有接缝。
 官方原话：Do not pin the known area with Set Latent Noise Mask.
 
-输出的是低像素草图（默认长边 768），拿它再去跑 MOSS 做最终风格重绘。
+输出的是低像素草图（默认长边 768，draft / reference 两个端口都是这张生成后的图），拿它再去跑 MOSS 做最终风格重绘。
 """
 from __future__ import annotations
 
@@ -25,7 +25,96 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sg_outpaint import _trim_solid_border, ASPECTS, TRIMS
+# 工具函数已内联（原 sg_outpaint.py 已删除，插件只保留两个节点）
+ASPECTS = ["16:9", "3:2", "4:3", "1:1", "3:4", "9:16", "2:1", "21:9", "自定义"]
+TRIMS = ["自动去黑边(推荐)", "不去黑边"]
+
+
+def _trim_solid_border(img: Image.Image, tol: int = 12,
+                       min_frac: float = 0.005) -> tuple[Image.Image, list, dict]:
+    """去掉源图四周自带的纯色边（黑边/白边/灰边）。
+
+    图库下载的图经常被人为 pad 成固定比例，四周留一圈纯黑（letterbox）。
+    这圈黑边如果留在原图区（mask=0，保留不重绘），采样器不会碰它，
+    成图就会带着黑边——这正是用户看到的「灰色和人物之间夹着黑条」。
+
+    只处理「整条边几乎全是同一纯色」的情况，避免误伤正常暗背景：
+    对上下左右各扫描若干行/列，若某条边 >=95% 的像素都接近同一颜色
+    （且该颜色很暗/很亮，即亮度 <40 或 >215），就认为它是 padding 并裁掉。
+    返回 (裁后的图, [left,top,right,bottom] 各边裁掉的像素, 每边颜色)。
+    """
+    a = np.asarray(img.convert("RGB")).astype(np.int16)
+    h, w, _ = a.shape
+    cut = [0, 0, 0, 0]          # left, top, right, bottom
+    colors: dict[str, list] = {}
+
+    def edge_uniform(strip: np.ndarray) -> tuple[bool, list]:
+        """strip: (N, W, 3) 或 (H, N, 3)。返回是否整条为纯色及该颜色。
+
+        判定严格，避免误伤暗色照片：
+        * 该条边 >=99% 像素与中位色差 <=tol
+        * 颜色本身必须极暗(亮度<18)或极亮(亮度>238)——padding 通常是纯黑/纯白
+        * 相邻 RGB 三通道差异也要小（纯灰阶），排除有色彩的暗背景
+        """
+        flat = strip.reshape(-1, 3)
+        med = np.median(flat, axis=0)
+        close = (np.abs(flat - med).max(axis=1) <= tol)
+        lum = float(med.mean())
+        spread = float(med.max() - med.min())  # 三通道是否接近（灰阶）
+        uniform = (close.mean() >= 0.99 and spread <= 6
+                   and (lum < 18 or lum > 238))
+        return uniform, [int(round(v)) for v in med]
+
+    max_side = min(h, w) // 4  # 单边最多裁 1/4，防止误裁整图
+
+    # 左边：从左往右逐列
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[:, i:i + 1, :])
+        if not ok:
+            break
+        colors.setdefault("left", col)
+        i += 1
+    cut[0] = i
+
+    # 右边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[:, w - 1 - i:w - i, :])
+        if not ok:
+            break
+        colors.setdefault("right", col)
+        i += 1
+    cut[2] = i
+
+    # 上边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[i:i + 1, :, :])
+        if not ok:
+            break
+        colors.setdefault("top", col)
+        i += 1
+    cut[1] = i
+
+    # 下边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[h - 1 - i:h - i, :, :])
+        if not ok:
+            break
+        colors.setdefault("bottom", col)
+        i += 1
+    cut[3] = i
+
+    l, t, r, b = cut
+    # 至少要裁掉一点（>=0.5% 边长）才认为有效；裁完必须还剩足够画面
+    if (l + r) / w < min_frac and (t + b) / h < min_frac:
+        return img, [0, 0, 0, 0], {}
+    if w - l - r < 32 or h - t - b < 32:
+        return img, [0, 0, 0, 0], {}
+    return img.crop((l, t, w - r, h - b)), cut, colors
+
 
 TRIGGER = ("Outpaint the image: replace the solid gray areas with a seamless "
            "continuation of the scene, keeping the existing picture unchanged.")
@@ -208,7 +297,7 @@ class ShangguQwenOutpaintDraft:
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
     RETURN_NAMES = ("draft", "reference", "info")
     OUTPUT_TOOLTIPS = ("低像素扩图草图，拿去跑 MOSS 重绘",
-                       "喂给模型的灰底参考图（调试用）",
+                       "生成后的扩图草图（与 draft 同一张，可直接当参考图用）",
                        "尺寸/比例/参数明细（JSON）")
     FUNCTION = "generate"
     CATEGORY = "Shanggu/Image"
@@ -282,7 +371,8 @@ class ShangguQwenOutpaintDraft:
             draft = _vae_decode(vae, sampled)
 
             drafts.append(draft)
-            refs.append(ref)
+            # reference 端口输出生成后的草图，不再输出生成前的灰底参考图
+            refs.append(draft)
             infos.append({
                 "index": i, "source_size": geo["source"],
                 "trim_cut": cut, "aspect": aspect, "target": [tw, th],
