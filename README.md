@@ -119,12 +119,28 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 ```
 图库选图器 / LoadImage
    └─ image → Qwen扩图草图 (Shanggu)
-                ├─ draft     → SaveImage（低像素草图，长边默认 768）
-                ├─ reference → PreviewImage（生成后的扩图草图，与 draft 同一张）
-                └─ info      → （尺寸/比例明细 JSON）
+                ├─ draft             → SaveImage（低像素草图，长边默认 768）
+                ├─ reference         → PreviewImage（生成后的扩图草图，与 draft 同一张）
+                └─ moss_conditioning → MOSS KSampler 的正面条件（positive）
 ```
 
-然后拿 `draft` 这张 16:9 草图，去你的 **MOSS 工作流**当输入重绘成最终风格。
+节点内部会用 **MOSS 自己的文本编码器 qwen3.5_9b** 重新"看"这张草图，编出 MOSS 能直接用的 conditioning，从第三个端口输出。
+
+#### 接到 MOSS 工作流（让 MOSS 看懂草图、不换人物）
+
+conditioning 和文本编码器是**绑定**的：Qwen 的 qwen3vl 编出来的条件 MOSS 不认（向量空间不同），所以节点内部改用 MOSS 的 `qwen3.5_9b`（`moss_image` 类型）+ `flux2-vae` 重新编码。接法：
+
+```
+moss_conditioning ──────────────→ MOSS KSampler.positive（正面条件）
+EmptyFlux2LatentImage（空 latent，尺寸和草图一致）→ MOSS KSampler.latent_image
+                                  MOSS KSampler: denoise = 1.0, 负面用空 conditioning
+```
+
+**latent 用空 latent、denoise=1.0**——参考图不是当采样起点，而是通过 `moss_conditioning` 里的 `reference_latents` + 视觉 token 喂给模型。这正是你之前 denoise 怎么调都不对的根因：把草图当 latent 起点 + 普通文字条件时，低 denoise 只会复刻草图的模糊、高 denoise 又丢掉人物；正确做法是让图走 conditioning、从空 latent 全新采样。
+
+**重要**：要让 conditioning 里的视觉信息真正生效，MOSS 模型侧要加载 **`图像编辑 [0.8-1.0] Moss-Image-Edit`** LoRA（和你现成 `mossImageEditInpaint_v10.json` 一致），并把 `moss_edit_format` 设为对应的 `Moss-Image-Edit`；否则纯文生图模型对参考 latent 的响应很弱。
+
+MOSS 侧的文本编码器 / VAE 文件名在节点的 `moss_clip_name`（默认 qwen3.5_9b_int8）、`moss_vae_name`（默认 flux2）下拉里选，本机已预置正确默认值。`moss_prompt` 留空即纯靠草图视觉信息重绘；需要指定改动时写编辑指令。
 
 **它是怎么解决多手脚 / 接缝 / 黑边的**（这是之前所有方案失败的根因）：
 
