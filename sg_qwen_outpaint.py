@@ -57,8 +57,9 @@ UNETS = _fl("unet", ["qwen_image_2.1_int8_convrot.safetensors"])
 CLIPS = _fl("clip", ["qwen3vl_8b_int8_convrot.safetensors"])
 VAES = _fl("vae", ["qwen_image_2.1_vae_bf16.safetensors"])
 LORAS = _fl("loras", [
-    "画面扩展 [0.8-1.0] qwen-image-2.1-outpaint-v2.safetensors",
-    "Turbo加速 [1.0-1.0] p_qwen_image_2.1_8step_v0.1-comfyui-T8.safetensors",
+    # 这两个 LoRA 在共享模型目录的子文件夹里，folder_paths 的名字必须带前缀
+    "Qwen\\画面扩展 [0.8-1.0] qwen-image-2.1-outpaint-v2.safetensors",
+    "Krea2\\Turbo加速 [1.0-1.0] p_qwen_image_2.1_8step_v0.1-comfyui-T8.safetensors",
 ])
 
 
@@ -67,6 +68,33 @@ def _default_choice(options, keyword):
         if keyword in name.lower():
             return name
     return options[0] if options else keyword
+
+
+def _resolve_lora(requested, keyword):
+    """把旧工作流里缺子目录前缀的 LoRA 名字纠正成 folder_paths 真实名字。
+
+    例如工作流存的是「画面扩展 ...outpaint-v2.safetensors」，
+    ComfyUI 实际认的是「Qwen\\画面扩展 ...outpaint-v2.safetensors」，
+    直接传给 LoraLoaderModelOnly 会 FileNotFoundError。这里按文件名
+    （去掉子目录前缀后）或关键词自动映射到列表里的真实名字。
+    """
+    try:
+        import folder_paths
+        names = list(folder_paths.get_filename_list("loras"))
+    except Exception:
+        names = []
+    if not names:
+        names = list(LORAS)
+    if requested in names:
+        return requested
+    base = str(requested or "").replace("\\", "/").split("/")[-1].lower()
+    for name in names:
+        if base and name.replace("\\", "/").split("/")[-1].lower() == base:
+            return name
+    for name in names:
+        if keyword in name.lower():
+            return name
+    return requested
 
 
 def _align32(n: int) -> int:
@@ -194,8 +222,12 @@ class ShangguQwenOutpaintDraft:
         unet_name = unet_name or _default_choice(UNETS, "qwen_image_2.1")
         clip_name = clip_name or _default_choice(CLIPS, "qwen3vl_8b")
         vae_name = vae_name or _default_choice(VAES, "qwen_image_2.1_vae")
-        outpaint_lora = outpaint_lora if outpaint_lora is not None else _default_choice(LORAS, "outpaint")
-        turbo_lora = turbo_lora if turbo_lora is not None else _default_choice(LORAS, "8step")
+        outpaint_lora = _resolve_lora(
+            outpaint_lora if outpaint_lora is not None else _default_choice(LORAS, "outpaint"),
+            "outpaint")
+        turbo_lora = _resolve_lora(
+            turbo_lora if turbo_lora is not None else _default_choice(LORAS, "8step"),
+            "8step")
 
         fast = quality.startswith("快速")
         steps = 8 if fast else 25
