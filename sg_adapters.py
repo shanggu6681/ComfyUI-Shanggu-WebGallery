@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import re
 import time
@@ -59,11 +60,33 @@ def cached_group(wid: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 网址改写（由 sg_server.rewrite_gallery_url 调用）
 # --------------------------------------------------------------------------- #
-def rewrite_extra(url: str, r18: bool = False) -> tuple[str, bool]:
+def _prev_month() -> str:
+    """返回上个月的 YYYY-MM，用于「上月榜」固定榜单。"""
+    today = datetime.date.today()
+    first = today.replace(day=1)
+    prev = first - datetime.timedelta(days=1)
+    return prev.strftime("%Y-%m")
+
+
+# aitag.win 的真实榜单路径（已从站点前端 app.js 逆向确认）：
+#   新作品 -> /api/ai_works_search
+#   月榜   -> /api/rank/monthly[/real]、/api/rank/monthly?period=YYYY-MM
+# 站点没有周榜/日榜/年榜接口（实测 404），所以下拉里只提供月榜的几种口径。
+AITAG_RANKS = {
+    "newest":     ("新作品", "search"),
+    "month":      ("本月榜", "monthly"),        # /api/rank/monthly（current）
+    "month_real": ("当月实时榜", "monthly_real"),
+    "month_prev": ("上月榜", "monthly_prev"),
+    "month_old":  ("往期榜", "monthly_old"),
+}
+
+
+def rewrite_extra(url: str, r18: bool = False, rank: str = "newest") -> tuple[str, bool]:
     """把图库网页地址改写成同站的 JSON 接口。
 
     r18=True 时请求该站的 18+ 作品集（show_r18=1）；该参数同时作用于
-    用户自己粘贴的 /api/ai_works_search 地址，保证面板开关始终有效。
+    用户自己粘贴的接口地址，保证面板开关始终有效。
+    rank 选择榜单：新作品 / 本月榜 / 当月实时 / 上月榜 / 往期榜。
     """
     try:
         p = urllib.parse.urlsplit(url)
@@ -75,21 +98,37 @@ def rewrite_extra(url: str, r18: bool = False) -> tuple[str, bool]:
     if host not in AITAG_HOSTS:
         return url, False
     show = "1" if r18 else "0"
-    if path.startswith("/api/"):
-        if "ai_works_search" in path:
-            # 已经是接口地址了，只把 18+ 参数同步成面板开关的值
-            fixed = sg.bump_query_param(url, "show_r18", show)
-            return fixed or url, False
-        return url, False
-
-    origin = f"{p.scheme or 'https'}://{p.netloc}"
     q = dict(urllib.parse.parse_qsl(p.query, keep_blank_values=True))
+    origin = f"{p.scheme or 'https'}://{p.netloc}"
 
-    # 单个作品页 /i/152099137 -> 直接取这一个作品的详情
+    # 单作品页 /i/152099137 -> 直接取这一个作品的详情（不受榜单影响）
     m = re.fullmatch(r"/i/(\d+)", path)
     if m:
         return f"{origin}/api/work/{m.group(1)}", True
 
+    # 已经是接口地址：只同步 18+，其余查询原样保留。
+    # 但如果用户当前选的榜单与地址里的路径不一致（例如从「新作品」切到
+    # 「本月榜」），也要把路径换掉，否则下拉框点了没反应。
+    if path.startswith("/api/"):
+        if ("ai_works_search" in path or "/rank/" in path or "sensitive" in path):
+            want_path, want_extra = _aitag_rank_target(rank)
+            if want_path and path != want_path:
+                merged = dict(q)
+                # 榜单路径切换时清掉另一个榜单专属的查询项，避免残留参数
+                for k in ("period", "month", "time_range"):
+                    merged.pop(k, None)
+                merged.update(want_extra)
+                merged["show_r18"] = show
+                merged.setdefault("page", "1")
+                merged.setdefault("page_size", "60")
+                merged.setdefault("sort", "new")
+                return f"{origin}{want_path}?" + urllib.parse.urlencode(merged), False
+            fixed = sg.bump_query_param(url, "show_r18", show)
+            return fixed or url, False
+        return url, False
+
+    # 网页地址 -> 按选中榜单构造接口
+    api_path, extra = _aitag_rank_target(rank)
     params = {
         "page": q.get("page") or "1",
         "page_size": q.get("page_size") or "60",  # 该接口要求 >= 60
@@ -97,11 +136,27 @@ def rewrite_extra(url: str, r18: bool = False) -> tuple[str, bool]:
         "time_range": q.get("time_range") or "all",
         "show_r18": show,
     }
+    params.update(extra)
     # 用户在网址里带的搜索词要保留下来
     for k in ("q", "prompt", "tag", "tags", "sensitive_policy"):
         if q.get(k):
             params[k] = q[k]
-    return f"{origin}/api/ai_works_search?" + urllib.parse.urlencode(params), True
+    return f"{origin}{api_path}?" + urllib.parse.urlencode(params), True
+
+
+def _aitag_rank_target(rank: str) -> tuple[str, dict]:
+    """把前端榜单值转成 (接口路径, 额外查询参数)。"""
+    key = str(rank or "newest").strip().lower()
+    kind = AITAG_RANKS.get(key, AITAG_RANKS["newest"])[1]
+    if kind == "monthly":
+        return "/api/rank/monthly", {"period": "current"}
+    if kind == "monthly_real":
+        return "/api/rank/monthly/real", {}
+    if kind == "monthly_prev":
+        return "/api/rank/monthly", {"period": _prev_month()}
+    if kind == "monthly_old":
+        return "/api/rank/monthly/fixed", {"month": "older"}
+    return "/api/ai_works_search", {}
 
 
 def match(url: str) -> bool:

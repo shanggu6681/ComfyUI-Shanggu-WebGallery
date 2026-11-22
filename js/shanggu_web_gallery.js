@@ -96,6 +96,26 @@ const CSS = `
 .sg-hint{font-size:10px;opacity:.75;line-height:1.5}
 .sg-hint code{color:#8ec5ff}
 .sg-bookmark{display:inline-block;margin-top:2px;color:#8ec5ff;text-decoration:underline;cursor:grab}
+/* 「加载内容」榜单选择 */
+.sg-rank{display:flex;gap:5px;align-items:center;font-size:10.5px;flex:none}
+.sg-rank label{opacity:.75;white-space:nowrap}
+.sg-rank select{flex:1;min-width:0;font-size:10.5px;padding:2px 4px}
+/* 网站设置（右下角齿轮打开） */
+.sg-sites{flex:none;border:1px solid var(--border-color,#4a4a4a);border-radius:4px;
+  padding:5px;background:rgba(0,0,0,.16);font-size:10.5px}
+.sg-sites[hidden]{display:none}
+.sg-sites-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-weight:600}
+.sg-sites-title span{opacity:.85}
+.sg-sites-list{display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;margin-bottom:4px}
+.sg-site-row{display:flex;gap:3px;align-items:center}
+.sg-site-row input{min-width:0;flex:1;font-size:10.5px;padding:2px 4px}
+.sg-site-row input.sg-site-name{flex:0 0 80px;font-weight:600}
+.sg-site-row button{flex:none;font-size:10px;padding:2px 5px}
+.sg-site-row button.sg-del:hover{border-color:#e05a5a;color:#ff9a9a}
+.sg-sites-add{display:flex;gap:3px;align-items:center}
+.sg-sites-add input{min-width:0;flex:1;font-size:10.5px;padding:2px 4px}
+.sg-sites-add input.sg-add-name{flex:0 0 80px}
+.sg-sites-msg{min-height:13px;font-size:10px;opacity:.7;margin-top:2px}
 `;
 
 function injectCSS() {
@@ -312,10 +332,11 @@ function buildPanel(node) {
   rowUrl.append(urlInput, btnSearch);
   const quick = el("div", "sg-quick");
   quick.appendChild(el("span", "", "快捷:"));
-  const btnPreset = el("button", "", "civitai.red 图库(API)");
-  const btnPresetAitag = el("button", "", "aitag.win");
-  quick.append(btnPreset, btnPresetAitag);
-  // 18+ 开关：aitag.win 的主要内容在 show_r18=1 里，默认开启
+  // 快捷按钮由「网站设置」里的站点列表动态生成；这里先放容器
+  const quickBtns = el("span", "sg-quick");
+  quickBtns.style.display = "inline-flex";
+  quick.appendChild(quickBtns);
+  // 18+ 开关：只在选中 aitag.win 站点时显示（该站主要内容在 show_r18=1）
   const r18Label = el("label", "sg-r18", "18+");
   const r18Chk = el("input");
   r18Chk.type = "checkbox";
@@ -323,8 +344,65 @@ function buildPanel(node) {
   r18Chk.title = "开启后请求 aitag.win 的 18+ 作品（默认开启）；关闭只看全年龄内容";
   r18Label.title = r18Chk.title;
   r18Label.prepend(r18Chk);
+  r18Label.hidden = true;
   quick.appendChild(r18Label);
   paneUrl.append(rowUrl, quick);
+
+  /* --- 加载内容（榜单/排序）：随当前站点的类型切换选项 --- */
+  const rankRow = el("div", "sg-rank");
+  rankRow.appendChild(el("label", "", "加载内容:"));
+  const rankSel = el("select");
+  rankRow.appendChild(rankSel);
+  paneUrl.appendChild(rankRow);
+
+  // 各站点的榜单选项（value 直接对应后端 settings.rank）
+  const RANK_OPTIONS = {
+    civitai: [
+      ["newest", "最新上传"], ["week", "周榜 · 最多赞"],
+      ["month", "月榜 · 最多赞"], ["year", "年榜 · 最多赞"],
+      ["all", "总榜 · 最多赞"], ["reactions", "最多点赞(全部)"],
+      ["comments", "最多评论"], ["collected", "最多收藏"],
+    ],
+    aitag: [
+      ["newest", "最新作品"], ["month", "本月榜"],
+      ["month_real", "当月实时榜"], ["month_prev", "上月榜"],
+      ["month_old", "往期榜"],
+    ],
+  };
+  function fillRankOptions(kind) {
+    const opts = RANK_OPTIONS[kind] || [];
+    rankSel.innerHTML = "";
+    opts.forEach(([v, t]) => {
+      const o = el("option", "", t);
+      o.value = v;
+      rankSel.appendChild(o);
+    });
+    rankRow.hidden = opts.length === 0;
+    // 记住每个站点上次选的榜单，切来切去不丢
+    const saved = (state && state.rankByKind && state.rankByKind[kind]) || "";
+    if (saved && opts.some((x) => x[0] === saved)) rankSel.value = saved;
+  }
+
+  /* --- 网站设置（右下角齿轮打开） --- */
+  const sitesBox = el("div", "sg-sites");
+  sitesBox.hidden = true;
+  const sitesTitle = el("div", "sg-sites-title");
+  sitesTitle.appendChild(el("span", "", "网站设置（名称会显示在快捷栏）"));
+  const btnSitesClose = el("button", "", "收起");
+  sitesTitle.appendChild(btnSitesClose);
+  sitesBox.appendChild(sitesTitle);
+  const sitesList = el("div", "sg-sites-list");
+  sitesBox.appendChild(sitesList);
+  const sitesAdd = el("div", "sg-sites-add");
+  const addName = el("input"); addName.placeholder = "名称"; addName.className = "sg-add-name";
+  const addUrl = el("input"); addUrl.placeholder = "https://… 网址";
+  const btnAddSite = el("button", "", "添加");
+  sitesAdd.append(addName, addUrl, btnAddSite);
+  sitesBox.appendChild(sitesAdd);
+  const sitesMsg = el("div", "sg-sites-msg", "");
+  sitesBox.appendChild(sitesMsg);
+  paneUrl.appendChild(sitesBox);
+
   panes.url = paneUrl;
 
   /* --- 粘贴源码 --- */
@@ -377,7 +455,9 @@ function buildPanel(node) {
   const btnMore = el("button", "", "加载更多");
   const btnAll = el("button", "", "全选可见");
   const btnClear = el("button", "", "清空选择");
-  footer.append(btnRun, btnMore, btnAll, btnClear);
+  const btnSites = el("button", "", "⚙ 网站");
+  btnSites.title = "管理常用网站（名称 + 网址），简化名会显示在上方快捷栏";
+  footer.append(btnRun, btnMore, btnAll, btnClear, btnSites);
   root.append(status, grid, footer);
 
   /* --- 高级设置 --- */
@@ -447,6 +527,8 @@ function buildPanel(node) {
     override: null,      // 循环执行期间临时写入 prompt 的单张 JSON
     runTotal: 0,
     runDone: 0,
+    rankByKind: {},      // 每个站点上次选的榜单，切换站点时保留
+    siteKind: "",        // 当前网址识别出的站点类型（civitai / aitag / 空）
   };
   // 用 Set 去重：解除上限后可能上万条，数组的 some() 会退化成 O(n²)
   state.seenUrls = new Set(state.items.map((x) => x && x.url).filter(Boolean));
@@ -457,6 +539,7 @@ function buildPanel(node) {
     Object.entries(fields).forEach(([k, inp]) => { s[k] = inp.value; });
     s.safe_only = fields.safe_only.value === "yes";
     s.r18 = r18Chk.checked;
+    s.rank = rankSel.value || "newest";   // 「加载内容」榜单选择
     try { s.per_page = Math.max(1, Math.min(400, parseInt(s.per_page || "200", 10))); }
     catch (e) { s.per_page = 200; }
     node.properties.sg_settings = s;
@@ -473,6 +556,113 @@ function buildPanel(node) {
     // 老工作流没存过 r18，默认开启（用户要的就是站点 18+ 内容）
     r18Chk.checked = s.r18 === undefined ? true : !!s.r18;
   }
+
+  /* --------------------------------------------------------------- 网站管理
+   * 站点列表存 localStorage（浏览器内全局共享，所有图库节点通用），并镜像
+   * 一份到 node.properties，便于换机器时随工作流带过去。
+   * 每个站点：{ name(简短名), url, kind(可选：civitai/aitag，决定榜单选项) }
+   */
+  const SITES_KEY = "sg_gallery_sites_v1";
+  const DEFAULT_SITES = [
+    { name: "civitai", url: "https://civitai.red/images", kind: "civitai" },
+    { name: "aitag", url: "https://aitag.win/", kind: "aitag" },
+  ];
+  let sites = [];
+  function loadSites() {
+    let arr = null;
+    try { arr = JSON.parse(localStorage.getItem(SITES_KEY) || "null"); } catch (e) {}
+    if (!Array.isArray(arr) || !arr.length) arr = node.properties.sg_sites;
+    if (!Array.isArray(arr) || !arr.length) arr = DEFAULT_SITES;
+    sites = arr.filter((x) => x && x.url).map((x) => ({
+      name: String(x.name || "网站").slice(0, 24),
+      url: String(x.url || ""),
+      kind: String(x.kind || ""),
+    }));
+  }
+  function saveSites() {
+    try { localStorage.setItem(SITES_KEY, JSON.stringify(sites)); } catch (e) {}
+    node.properties.sg_sites = sites.map((x) => ({ ...x }));
+  }
+  function kindOfUrl(u) {
+    const s = String(u || "").toLowerCase();
+    if (s.indexOf("civitai") >= 0) return "civitai";
+    if (s.indexOf("aitag.win") >= 0) return "aitag";
+    return "";
+  }
+  function detectSiteKind() {
+    const k = kindOfUrl(urlInput.value);
+    if (k === state.siteKind && rankSel.options.length) return;
+    state.siteKind = k;
+    const savedRank = state.rankByKind[k] || "";
+    fillRankOptions(k);
+    if (savedRank) rankSel.value = savedRank;
+    r18Label.hidden = (k !== "aitag");   // 18+ 只在 aitag 站点出现
+  }
+  function renderQuickButtons() {
+    quickBtns.innerHTML = "";
+    sites.forEach((site, idx) => {
+      const b = el("button", "", site.name);
+      b.title = site.url;
+      b.onclick = () => {
+        urlInput.value = site.url;
+        rememberUrl(site.url);
+        detectSiteKind();
+        doFetch(true);
+      };
+      quickBtns.appendChild(b);
+    });
+  }
+  function renderSitesList() {
+    sitesList.innerHTML = "";
+    sites.forEach((site, idx) => {
+      const rowEl = el("div", "sg-site-row");
+      const nameInp = el("input", "sg-site-name");
+      nameInp.value = site.name;
+      nameInp.placeholder = "名称";
+      const urlInp = el("input");
+      urlInp.value = site.url;
+      urlInp.placeholder = "https://…";
+      const btnSave = el("button", "", "保存");
+      btnSave.onclick = () => {
+        const nm = nameInp.value.trim() || ("网站" + (idx + 1));
+        const uu = urlInp.value.trim();
+        if (!/^https?:\/\//i.test(uu)) { sitesMsg.textContent = "网址需以 http:// 或 https:// 开头"; return; }
+        sites[idx] = { name: nm, url: uu, kind: site.kind || kindOfUrl(uu) };
+        saveSites(); renderQuickButtons(); renderSitesList();
+        sitesMsg.textContent = "已保存 " + nm;
+      };
+      const btnDel = el("button", "sg-del", "×");
+      btnDel.title = "删除这个网站";
+      btnDel.onclick = () => {
+        sites.splice(idx, 1);
+        saveSites(); renderQuickButtons(); renderSitesList();
+        sitesMsg.textContent = "已删除";
+      };
+      rowEl.append(nameInp, urlInp, btnSave, btnDel);
+      sitesList.appendChild(rowEl);
+    });
+  }
+  btnAddSite.onclick = () => {
+    const nm = addName.value.trim() || ("网站" + (sites.length + 1));
+    const uu = addUrl.value.trim();
+    if (!/^https?:\/\//i.test(uu)) { sitesMsg.textContent = "网址需以 http:// 或 https:// 开头"; return; }
+    sites.push({ name: nm, url: uu, kind: kindOfUrl(uu) });
+    addName.value = ""; addUrl.value = "";
+    saveSites(); renderQuickButtons(); renderSitesList();
+    sitesMsg.textContent = "已添加 " + nm + "，点上方快捷按钮即可打开";
+  };
+  btnSites.onclick = () => {
+    const show = sitesBox.hidden;
+    sitesBox.hidden = !show;
+    if (show) { renderSitesList(); sitesMsg.textContent = ""; }
+  };
+  btnSitesClose.onclick = () => { sitesBox.hidden = true; };
+  rankSel.onchange = () => {
+    state.rankByKind[state.siteKind] = rankSel.value;
+    // 只改「加载内容」方式时，用当前网址重新搜索（后端会按新 rank 构造接口）
+    rememberUrl(urlInput.value.trim());
+    doFetch(true);
+  };
 
   const currentSerialized = () =>
     state.override != null ? state.override : JSON.stringify(state.selected);
@@ -838,16 +1028,8 @@ function buildPanel(node) {
     if (ww) ww.value = value;
     node.properties.sg_url = value;
   }
-  btnSearch.onclick = () => { rememberUrl(urlInput.value.trim()); doFetch(true); };
-  urlInput.onchange = () => rememberUrl(urlInput.value.trim());
-  btnPreset.onclick = () => { urlInput.value = PRESET; rememberUrl(PRESET); doFetch(true); };
-  btnPresetAitag.onclick = () => {
-    const u = "https://aitag.win/";
-    urlInput.value = u;
-    r18Chk.checked = true;
-    rememberUrl(u);
-    doFetch(true);
-  };
+  btnSearch.onclick = () => { rememberUrl(urlInput.value.trim()); detectSiteKind(); doFetch(true); };
+  urlInput.onchange = () => { rememberUrl(urlInput.value.trim()); detectSiteKind(); };
   // 手动点「加载更多」永远无视 1500 格软上限，哪怕状态栏已经提示到顶
   btnMore.onclick = () => doFetch(false, { ignoreLimit: true });
   btnParse.onclick = doParse;
@@ -919,6 +1101,16 @@ function buildPanel(node) {
     const sw = w("site_url");
     urlInput.value = (sw && sw.value) || node.properties.sg_url || PRESET;
     restoreSettings();
+    // 站点列表 + 快捷按钮 + 榜单联动
+    loadSites();
+    renderQuickButtons();
+    const savedRank = (node.properties.sg_settings || {}).rank;
+    if (savedRank) state.rankByKind[kindOfUrl(urlInput.value)] = savedRank;
+    state.siteKind = "";          // 强制 detectSiteKind 重建选项
+    detectSiteKind();
+    if (savedRank && rankSel.querySelector('option[value="' + savedRank + '"]')) {
+      rankSel.value = savedRank;
+    }
     if (node.properties.sg_select_mode) {
       const sm = w("select_mode");
       if (sm) sm.value = node.properties.sg_select_mode;

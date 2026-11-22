@@ -13,10 +13,13 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from sg_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS  # noqa: E402
+import sg_outpaint  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_outpaint.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_outpaint.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
 import sg_server  # noqa: E402,F401  (导入即注册 /sg_gallery/* 路由)
 
 WEB_DIRECTORY = "./js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取")
+print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取 / 图像扩图→Latent")

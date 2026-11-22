@@ -55,6 +55,9 @@ def _clean_settings(raw: Any) -> dict:
     # 18+ 开关：默认开启（aitag.win 这类站点的主要内容就在 show_r18=1 里）
     rv = raw.get("r18", True)
     out["r18"] = rv is not False and str(rv).lower() not in ("false", "0", "no", "off", "")
+    # 榜单/排序方式：civitai 用 sort+period，aitag.win 用 /api/rank/... 路径。
+    # 值来自前端「加载内容」里的下拉框，默认 newest（站点默认流）。
+    out["rank"] = str(raw.get("rank") or "newest").strip().lower()
     try:
         out["per_page"] = max(1, min(400, int(raw.get("per_page") or 200)))
     except Exception:
@@ -74,23 +77,63 @@ def _new_items(s: dict, items: list[dict]) -> list[dict]:
     return out
 
 
-def rewrite_gallery_url(url: str, r18: bool = True) -> tuple[str, bool]:
+def rewrite_gallery_url(url: str, r18: bool = True, rank: str = "newest") -> tuple[str, bool]:
     """网页版图库被 Cloudflare 挡住 / 是 SPA 时，自动改用同站的官方 JSON 接口。
 
     返回值第二个元素只表示「网页地址被换成接口」，用于前端提示；
-    18+ 参数的同步不算改写，但仍会返回调整后的地址。
+    18+ / 榜单参数的同步不算改写，但仍会返回调整后的地址。
+
+    rank（前端「加载内容」下拉）：
+      civitai  -> newest / week / month / year / all / reactions / comments / collected
+      aitag    -> newest / month / month_prev / month_old / ...（见 adapters.rank_to_api）
     """
     try:
         p = urllib.parse.urlsplit(url)
         host = (p.netloc or "").lower().split(":")[0]
         path = (p.path or "").rstrip("/")
-        if host.startswith(("civitai.", "www.civitai.")) and path in ("", "/images"):
-            return f"https://{p.netloc}/api/v1/images?limit=20", True
+        if host.startswith(("civitai.", "www.civitai.")):
+            # 已经是接口地址：把榜单参数同步进去（18+ 由调用方在 settings 里带）
+            if path.startswith("/api/v1/images"):
+                return _civitai_rank_url(f"https://{p.netloc}{p.path}", rank, p.query), False
+            if path in ("", "/images", "/models"):
+                return _civitai_rank_url(f"https://{p.netloc}/api/v1/images", rank, ""), True
     except Exception:
         pass
     # SPA 图库（HTML 里没有图片，全靠 JS 调自家 JSON 接口）
-    extra, hit = adapters.rewrite_extra(url, r18)
+    extra, hit = adapters.rewrite_extra(url, r18, rank)
     return extra or url, bool(hit)
+
+
+def _civitai_rank_url(api_base: str, rank: str, old_query: str = "") -> str:
+    """给 civitai /api/v1/images 加上 sort + period，得到不同榜单。
+
+    实测该接口支持：
+      sort=Newest | Most Reactions | Most Comments | Most Collected
+      period=AllTime | Day | Week | Month | Year
+    「周榜/月榜/年榜/总榜」= Most Reactions + 对应 period；默认流 = sort=Newest。
+    """
+    params = dict(urllib.parse.parse_qsl(old_query, keep_blank_values=True))
+    params.setdefault("limit", "20")
+    params.pop("sort", None)
+    params.pop("period", None)
+    table = {
+        "newest":     ("Newest", None),
+        "reactions":  ("Most Reactions", "AllTime"),
+        "all":        ("Most Reactions", "AllTime"),
+        "week":       ("Most Reactions", "Week"),
+        "month":      ("Most Reactions", "Month"),
+        "year":       ("Most Reactions", "Year"),
+        "day":        ("Most Reactions", "Day"),
+        "comments":   ("Most Comments", None),
+        "collected":  ("Most Collected", None),
+        "comments_week":  ("Most Comments", "Week"),
+        "collected_week": ("Most Collected", "Week"),
+    }
+    sort, period = table.get(rank, ("Newest", None))
+    params["sort"] = sort
+    if period:
+        params["period"] = period
+    return api_base + "?" + urllib.parse.urlencode(params)
 
 
 def _render_template(tpl: str, base: str, page: int) -> str:
@@ -143,7 +186,9 @@ async def handle_fetch(request: web.Request) -> web.Response:
 
     rewritten = False
     if reset:
-        url, rewritten = rewrite_gallery_url(url, bool(settings.get("r18", True)))
+        url, rewritten = rewrite_gallery_url(
+            url, bool(settings.get("r18", True)), str(settings.get("rank") or "newest")
+        )
         s["base"] = url
         s["next"] = None
         s["page"] = 1

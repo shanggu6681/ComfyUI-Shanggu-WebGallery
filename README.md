@@ -40,6 +40,8 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | 能力 | 说明 |
 | --- | --- |
 | 网址抓取 | 静态 HTML、SPA 内嵌 JSON、纯 JSON API、每行一个图片网址，都能提取图片；`civitai.red` / `aitag.win` 内置站点适配，网页地址自动换成能出图的接口 |
+| 加载内容（榜单） | 网址框下方「加载内容」下拉，按站点切换：`civitai` 可选最新/周榜/月榜/年榜/总榜/最多评论/最多收藏；`aitag.win` 可选最新/本月榜/当月实时/上月榜/往期榜。切换后用当前网址重新抓取即可出不同的一批图，解决「永远是同一批图」的问题 |
+| 多网站快捷栏 + 设置 | 面板底部 **「⚙ 网站」** 打开网站设置，可增删/改名多个网站，简短名称直接变成上方快捷按钮（如 `civitai`、`aitag`）；点击即填入网址并抓取。列表存浏览器 localStorage，所有图库节点通用 |
 | 无限滚动 | 滚动到底自动加载下一页；支持 `nextPage` 游标、`{page}` / `{offset}` / `{cursor}` 分页模板；固定正方形行高。整页被去重或接口偶发空页时会自动续拉，不会卡死在底部。自动滚动到 1500 格会**暂停**，点 **「加载更多(解除上限)」** 即可无视上限继续加载，解除后滚动也不再受限 |
 | 检索页两层显示 | `aitag.win` 这类「一个作品 = 多张图」的站点，检索页每个作品只显示 1 张封面；点封面才在它后面紧挨着展开同系列，没点开的完全不显示 |
 | 缩略图代理 | 后端代抓并缓存缩略图，解决跨域、防盗链、Referer 校验；Civitai CDN 自动改用 `width=400` 小图 |
@@ -57,7 +59,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
    ComfyUI/custom_nodes/ComfyUI-Shanggu-WebGallery/
    ```
 2. 重启 ComfyUI（或浏览器 **Ctrl+F5** 强制刷新，扩展 JS 是动态扫描的）。
-3. 双击画布搜索 **网页图库选图器** 或 `ShangguWebImageGallery`。
+3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）或 **图像扩图→Latent**（`ShangguImageExpandToLatent`）。新增节点若没出现，重启一次 ComfyUI 即可。
 
 无需 `pip install`：核心依赖 `aiohttp`、`PIL`、`numpy`、`torch` 都是 ComfyUI 自带的。
 
@@ -111,24 +113,77 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 
 把 `info_json` 里指定字段（如 `prompt`、`url`）按索引拆成 `STRING`，方便直接接文本编码节点做「看图写提示词」。
 
+### 图像扩图→Latent `ShangguImageExpandToLatent`
+
+一个节点**代替「缩放图像 + VAE 编码」**，专门解决「竖屏原图要生成横屏图」的问题。老的缩放节点只有两条路：居中裁切（只剩中间一条、主体丢失）或直接拉伸（变形、两侧黑框），都出不了满屏的横屏图。本节点走标准 outpainting：
+
+```
+原图(可竖屏) → 可选裁切上下 → 等比缩放(不拉伸) → 贴到目标横屏画布
+            → 扩出来的左右区域写进 mask → VAE 编码成带 noise_mask 的 latent
+            → KSampler 按文本只补扩展区，原图部分原样保留
+```
+
+| 输出 | 类型 | 说明 |
+| --- | --- | --- |
+| `latent` | `LATENT` | 带 `noise_mask`：**直接接 KSampler 的 `latent_image`**，扩展区会被文本补全 |
+| `expanded_image` | `IMAGE` | 扩好图后的画布（扩展区是底色），可接 PreviewImage 看构图 |
+| `expand_mask` | `MASK` | 扩展区为白（要重绘）、原图区为黑（保留） |
+| `info` | `STRING` | 原图尺寸、目标尺寸、裁切量、贴入位置、扩展像素数 |
+
+主要输入：
+
+| 输入 | 默认 | 作用 |
+| --- | --- | --- |
+| `image` / `vae` | — | 输入图（可来自图库节点或 LoadImage）与编码用的 VAE（要和采样模型匹配） |
+| `aspect` | `16:9` | 目标比例：16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 9:16 / 2:1 / 21:9 / 自定义 |
+| `long_side` | 1024 | 目标长边像素；短边按比例算并对齐到 8 的倍数 |
+| `vertical_crop` | 0.0 | **从原图上下各裁掉的比例**。`0`=整张竖图保留、左右扩得最多；`0.1~0.2`=轻微裁切、减少扩图面积；越接近 0.45 越像中心裁剪 |
+| `position` | 居中 | 原图贴在画布的位置（居中/偏左/偏右/偏上/偏下） |
+| `fill` | 中性灰 | 扩展区底色，中性灰是 inpaint 标准、latent 编码最稳 |
+| `mask_grow` | 8 | mask 向原图内侧膨胀几像素，让接缝更自然；0=不膨胀 |
+
+用法：把 `latent` 接 KSampler 的 `latent_image`，positive 写你想扩出来的内容（如「延续的画面、背景、天空」），**denoise 建议 0.9~1.0**（太低会补不满扩展区）。要更干净的接缝，可在前面接 `InpaintModelConditioning`。竖图扩横屏时选 `16:9` + `vertical_crop=0`（完整保留整张图，左右补），或 `vertical_crop=0.1~0.2`（轻微裁掉上下、少扩一点、主体更突出）——这就是用户要的「裁切上下一小部分或不裁切，再不拉伸地左右扩图」。
+
+> 本节点输出的是 latent，**不是** IMAGE，因此它放在 VAE 编码那一步的位置，用不到也请删掉原来的「缩放图像 / VAE Encode」，别重复接线。
+
 ---
+
+## 加载内容（榜单 / 排序）
+
+`civitai` 和 `aitag.win` 的默认接口都是「按热度/时间排的默认流」，所以不指定排序时每次看到的几乎是同一批图。网址框下方的 **「加载内容」** 下拉就是用来换榜单的：选好后点 **搜索**（或切换时自动重搜），后端会按选中的榜单重新构造接口地址，出完全不同的图。每个站点记住自己上次选的榜单，来回切换不丢。
+
+| 站点 | 可选项 | 实际接口参数 |
+| --- | --- | --- |
+| civitai | 最新上传 / 周榜 / 月榜 / 年榜 / 总榜 / 最多点赞 / 最多评论 / 最多收藏 | `sort=Newest` 或 `sort=Most Reactions\|Most Comments\|Most Collected`，榜单再加 `period=Week\|Month\|Year\|AllTime` |
+| aitag.win | 最新作品 / 本月榜 / 当月实时榜 / 上月榜 / 往期榜 | 最新=`/api/ai_works_search`；月榜=`/api/rank/monthly[/real]`，往期用 `period=YYYY-MM` / `month=older` |
+
+> `civitai` 的「最新上传」是 `sort=Newest`（实测会返回全新的高 ID 图片）；「总榜」是 `sort=Most Reactions&period=AllTime`。`aitag.win` 站点本身**没有**周榜/日榜/年榜接口（实测 404），下拉里就只有它真实支持的月榜系列。18+ 开关对榜单同样生效。
+
+## 多网站快捷栏与网站设置
+
+面板底部的 **「⚙ 网站」** 按钮打开网站设置：
+
+- 每条网站有 **名称** 和 **网址**，名称会以简短按钮的形式出现在网址框下方的快捷栏（默认就是 `civitai` 和 `aitag`，点一下即填入网址并抓取）；
+- 可「保存」改名/改址、「×」删除，或在底部输入名称+网址「添加」；
+- 网址必须是 `http://` 或 `https://` 开头；站点类型（civitai / aitag / 其他）会根据网址自动识别，决定显示哪组「加载内容」选项和是否显示 18+ 开关；
+- 列表保存在浏览器 `localStorage`，同一个浏览器里所有图库节点共用；同时镜像进工作流，换机器打开也能带过去。
 
 ## 站点适配 / 图片来源
 
 ### civitai.red
 
-`https://civitai.red/images` 网页版会返回 **Cloudflare 403**，纯 HTTP 抓不到图；但同站的 `https://civitai.red/api/v1/images?limit=20` 是 200 直出 JSON，带 `items[].url` 和 `metadata.nextPage` 游标分页。因此节点内置了**自动改写**：直接输入 `/images` 也会切到该 JSON 接口，照样出图。
+`https://civitai.red/images` 网页版会返回 **Cloudflare 403**，纯 HTTP 抓不到图；但同站的 `https://civitai.red/api/v1/images?limit=20` 是 200 直出 JSON，带 `items[].url` 和 `metadata.nextPage` 游标分页。因此节点内置了**自动改写**：直接输入 `/images` 也会切到该 JSON 接口，照样出图。配合「加载内容」下拉会自动追加 `sort` / `period` 参数（见上表）。
 
 ### aitag.win（SPA 图库）
 
 `https://aitag.win/` 是纯前端渲染的站点：首页 HTML 里只有一张 `og:image`，瀑布流全靠 JS 调 `/api/ai_works_search` 填充，所以通用提取器直接抓首页会「一张图都没有」。节点内置了专用适配：
 
-| 你填的网址 | 实际请求 |
-| --- | --- |
-| `https://aitag.win/` | `/api/ai_works_search?page=1&page_size=60&sort=new&show_r18=1…` |
-| `https://aitag.win/?q=初音` | 同上，并保留 `q` 搜索词 |
-| `https://aitag.win/i/152099137` | `/api/work/152099137`，只出这一个作品的所有图 |
-| 直接填 `/api/ai_works_search?...` | 不改路径，只把 `show_r18` 同步成面板开关的值 |
+| 你填的网址 | 「加载内容」选最新时 | 选月榜系列时 |
+| --- | --- | --- |
+| `https://aitag.win/` | `/api/ai_works_search?page=1&page_size=60&sort=new&show_r18=1…` | `/api/rank/monthly[/real]?…`（往期带 `period=YYYY-MM` 或 `month=older`） |
+| `https://aitag.win/?q=初音` | 同上，并保留 `q` 搜索词 | 同上 |
+| `https://aitag.win/i/152099137` | `/api/work/152099137`，只出这一个作品的所有图（不受榜单影响） | — |
+| 直接填 `/api/ai_works_search?...` 或 `/api/rank/...` | 同步 `show_r18`；若榜单与地址路径不一致则按下拉重建路径，其余查询项保留 | |
 
 列表接口只给作品信息，图片真地址在 `/api/work/{id}` 的 `images[]` 里（`image_type/author_id/file_name.webp`）。适配器会**并发拉取详情**拼出站点 CDN 的 webp 直链并缓存每个作品的全部图片，但检索页只交付封面；一页 60 个作品约 2~7 秒，按 `page` 自动翻页滚动续加载。CDN 和 Pixiv 原图都有防盗链，节点会自动带上正确的 Referer，无需手动填。
 
@@ -145,7 +200,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 
 #### 18+ 开关
 
-网址框下方的 **`18+` 勾选框默认开启**，对应接口的 `show_r18=1`，会抓取该站的成人作品集（总量约 285 万，与全年龄内容完全不同、不重叠）。取消勾选即 `show_r18=0`，只看全年龄内容（约 103 万）。快捷按钮 `aitag.win` 会一键填好网址并把开关恢复到开启。开关状态随工作流保存，滚动翻页也会一直沿用当前值。
+**18+ 勾选框只在网址属于 `aitag.win` 时才显示**（选到 civitai 或其他站点会自动隐藏），默认开启，对应接口的 `show_r18=1`，会抓取该站的成人作品集（总量约 285 万，与全年龄内容完全不同、不重叠）。取消勾选即 `show_r18=0`，只看全年龄内容（约 103 万）。快捷按钮 `aitag` 会一键填好网址并把开关恢复到开启。开关状态随工作流保存，滚动翻页和榜单切换也会一直沿用当前值。
 
 该站的 `/api/sensitive_works_search` 敏感专用接口受地区/语言策略限制会返回 `sensitive_content_blocked`，所以节点走的是普通列表接口的 `show_r18` 参数；实测 18+ 作品的详情与 CDN 直链都不需要额外的访问码或登录。请遵守当地法律与站点条款，未成年人勿用。
 
@@ -193,12 +248,13 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | 路由 | 作用 |
 | --- | --- |
 | `GET /sg_gallery/health` | 健康检查 |
-| `POST /sg_gallery/fetch` | 抓取一页（带会话去重、游标分页、自动改写） |
+| `POST /sg_gallery/fetch` | 抓取一页（带会话去重、游标分页、自动改写、榜单排序） |
 | `POST /sg_gallery/parse` | 解析粘贴的 HTML / JSON / 网址列表 |
+| `POST /sg_gallery/expand` | 点开检索页封面时取回该作品的同系列图片 |
 | `GET /sg_gallery/thumb` | 缩略图代理 + 磁盘缓存 |
 | `POST /sg_gallery/select` | 下载选中原图到 `input/` 并返回文件名与尺寸；同 URL 只下载一次 |
 
-> 源码文件统一用 `sg_` 前缀命名（`sg_nodes.py` / `sg_server.py` / `sg_scraper.py`），避免自定义节点目录进入 `sys.path` 后遮蔽 ComfyUI 内建的 `nodes` / `server` 模块。
+> 源码文件统一用 `sg_` 前缀命名（`sg_nodes.py` / `sg_server.py` / `sg_scraper.py` / `sg_adapters.py` / `sg_outpaint.py`），避免自定义节点目录进入 `sys.path` 后遮蔽 ComfyUI 内建的 `nodes` / `server` 模块。
 
 ---
 
