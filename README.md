@@ -59,7 +59,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
    ComfyUI/custom_nodes/ComfyUI-Shanggu-WebGallery/
    ```
 2. 重启 ComfyUI（或浏览器 **Ctrl+F5** 强制刷新，扩展 JS 是动态扫描的）。
-3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）或 **图像扩图→Latent**（`ShangguImageExpandToLatent`）。新增节点若没出现，重启一次 ComfyUI 即可。
+3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
 
 无需 `pip install`：核心依赖 `aiohttp`、`PIL`、`numpy`、`torch` 都是 ComfyUI 自带的。
 
@@ -150,6 +150,31 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 用法：把 `latent` 接 KSampler 的 `latent_image`，positive 写你想扩出来的内容（如「延续的画面、背景、天空」），**denoise 建议 0.9~1.0**（太低会补不满扩展区）。要更干净的接缝，可在前面接 `InpaintModelConditioning`。竖图扩横屏时选 `16:9` + `vertical_crop=0`（完整保留、左右补），或 `vertical_crop=0.1~0.2`（轻微裁上下、人像更充盈、少扩一点）——这就是你要的「裁切上下一小部分或不裁切，再不拉伸地左右扩图」。如果成图还有黑条，先看 `expanded_image` 输出：若那里就有黑条，说明是源图 padding，`trim` 没识别时可手动裁源图或选纯色更接近的填充。
 
 > 本节点输出的是 latent，**不是** IMAGE，因此它放在 VAE 编码那一步的位置，用不到也请删掉原来的「缩放图像 / VAE Encode」，别重复接线。
+
+### 图像重绘准备→Latent img2img `ShangguImagePrepForImg2Img`
+
+给「**大致保持人物和风格、动作可变、尺寸达标就行**」的重绘需求用。它和上面的扩图节点是**两个完全不同的东西**，别混：
+
+| | 图像扩图→Latent | 图像重绘准备→Latent（本节点） |
+| --- | --- | --- |
+| 目标 | 补出新区域，原图像素一动不动 | 整张重绘成新图，人物/风格大致保持 |
+| mask | 带 `noise_mask`，只重绘灰边 | **不带 mask**，整图按 denoise 重绘 |
+| denoise | 0.9~1.0（要补满灰边） | **0.35~0.5 保留多 / 0.6~0.7 改造多 / >0.75 放飞** |
+| 尺寸 | 高度贴合、左右补灰 | **整图裁切/缩放铺满目标尺寸，无灰边** |
+
+工作流只有一条链：
+
+```
+图库节点(或LoadImage) → 本节点(aspect / long_side) → KSampler(latent_image, denoise 0.5) → VAEDecode → SaveImage
+```
+
+- `fit` 选 **`裁切填满(推荐,无留白)`**：等比放大后按 `position` 裁掉多余部分，画布每个像素都有内容可重绘，最适合 img2img；选 `完整保留(补灰边)` 则整图可见、边缘补灰。
+- `size_multiple` 默认 **16**——**MOSS-Image 要求边长是 16 的倍数**，直接用默认即可；SDXL / Flux / H3 用 8 或 16 都兼容。
+- 输出 `latent` **不带 `noise_mask`**，所以 KSampler 的 denoise 直接控制整图重绘强度；`prepared_image` 可接 PreviewImage 先看裁切构图对不对。
+
+**关于 MOSS**：MOSS-Image 本体是纯文生图，**原生不认参考图**（模板里的 `ref_image` 只喂给可选的 prompt enhancer，模型读不到图像内容）。所以要"看着原图重绘"就必须走本节点的 img2img 通道，让原图 latent 当构图+风格底子。MOSS 采样建议：**50 steps / CFG 3 / euler + sgm_uniform / shift 5（ModelSamplingAuraFlow multiplier 1）/ skip layer guidance layer 22**，VAE 用 `flux2-vae`。显存方面 int8 主模型约 5.4GB + Qwen3.5 文本编码器约 7.3GB，16GB 卡能跑但较紧。
+
+> 想要更强的"人物长得像"、跨场景保持同一角色，可以另装社区方案 `MOSS-Image CharRef v2`（edit LoRA + ostris 的 edit 节点，参考图接 `image1`，提示词以 `Same character and art style as Picture 1.` 开头）。但那要额外下 LoRA 和节点，且对"动作可 free 调整"的需求来说，本节点 + 合适 denoise 通常已经够用。
 
 ---
 

@@ -321,9 +321,190 @@ class ShangguImageExpandToLatent:
         )
 
 
+FITS = ["裁切填满(推荐,无留白)", "完整保留(补灰边)"]
+
+
+def _plural_to_wh_ex(aspect: str, long_side: int, w: int, h: int, align: int = 16) -> tuple[int, int]:
+    """和 _plural_to_wh 一样，但对齐粒度可选。
+
+    MOSS-Image 要求边长是 16 的倍数；SDXL/Flux/H3 用 8 就够。
+    """
+    if aspect == "自定义":
+        tw, th = int(w), int(h)
+    elif ":" in aspect:
+        a, b = aspect.split(":", 1)
+        try:
+            ar, br = float(a), float(b)
+        except ValueError:
+            ar, br = 16.0, 9.0
+        long_side = max(64, int(long_side))
+        if ar >= br:
+            tw, th = long_side, long_side * br / ar
+        else:
+            th, tw = long_side, long_side * ar / br
+    else:
+        tw, th = 16.0, 9.0
+    a = max(8, int(align))
+    tw = max(a, (int(round(tw)) // a) * a)
+    th = max(a, (int(round(th)) // a) * a)
+    return tw, th
+
+
+def _fit_cover_canvas(src: Image.Image, tw: int, th: int, position: str,
+                      fill_rgb: tuple[int, int, int]):
+    """把源图铺满目标画布。
+
+    cover = 等比放大到宽高都不小于画布 → 按 position 裁掉多出来的部分。
+    整个过程不拉伸、不留白，最适合 img2img（画布每个像素都有内容可重绘）。
+    contain = 等比缩小到整图可见 → 短出来的部分补 fill 颜色。
+
+    返回 (canvas RGB, geo)。裁切量记进 geo.info 方便调 position。
+    """
+    sw, sh = src.size
+    scale = max(tw / float(sw), th / float(sh))
+    nw = max(1, int(round(sw * scale)))
+    nh = max(1, int(round(sh * scale)))
+    r = src.convert("RGB").resize((nw, nh), Image.LANCZOS)
+    x = nw - tw
+    y = nh - th
+    if position == "偏左":
+        cx = 0
+    elif position == "偏右":
+        cx = x
+    else:
+        cx = x // 2
+    if position == "偏上":
+        cy = 0
+    elif position == "偏下":
+        cy = y
+    else:
+        cy = y // 2
+    canvas = r.crop((cx, cy, cx + tw, cy + th))
+    return canvas, {"scale": scale, "resized": [nw, nh], "crop_origin": [cx, cy],
+                    "crop_px": [x, y], "mode": "cover"}
+
+
+def _fit_contain_canvas(src: Image.Image, tw: int, th: int, position: str,
+                        fill_rgb: tuple[int, int, int]):
+    """整图可见，短出来的边补纯色。返回 (canvas RGB, geo)。"""
+    sw, sh = src.size
+    scale = min(tw / float(sw), th / float(sh))
+    nw = max(1, int(round(sw * scale)))
+    nh = max(1, int(round(sh * scale)))
+    r = src.convert("RGB").resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGB", (tw, th), fill_rgb)
+    x = tw - nw
+    y = th - nh
+    cx = 0 if position == "偏左" else (x if position == "偏右" else x // 2)
+    cy = 0 if position == "偏上" else (y if position == "偏下" else y // 2)
+    canvas.paste(r, (cx, cy))
+    return canvas, {"scale": scale, "resized": [nw, nh], "paste_origin": [cx, cy],
+                    "pad_px": [x, y], "mode": "contain"}
+
+
+class ShangguImagePrepForImg2Img:
+    """图生图预处理：整图铺到目标尺寸 → VAE 编码成 latent（不带 mask）。
+
+    和「图像扩图→Latent」的区别（很重要，别混用）：
+    * 扩图节点：原图贴中间，四周补灰 + noise_mask，采样器只重绘扩展区，
+      原图像素一动不动 —— 适合「扩边、原图必须一模一样」。
+    * 本节点：整图裁切/缩放到目标尺寸，输出**不带 noise_mask** 的 latent，
+      KSampler 的 denoise 决定整图重绘强度 —— 适合「人物/风格大致保持、
+      动作可变、尺寸只要达标」的 img2img 重绘。
+      denoise 0.35~0.5 更像原图；0.55~0.7 改造更明显；>0.75 基本放飞。
+
+    MOSS-Image 要求边长是 16 的倍数，size_multiple 默认就是 16；
+    SDXL / Flux / H3 用 8 即可（也兼容 16）。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "输入图像（图库节点 / LoadImage 均可）"}),
+                "vae": ("VAE", {"tooltip": "和采样模型匹配的 VAE；MOSS 用 flux2-vae"}),
+                "aspect": (ASPECTS, {"default": "16:9", "tooltip": "目标比例"}),
+                "long_side": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 16,
+                                      "tooltip": "目标长边像素"}),
+                "fit": (FITS, {"default": FITS[0],
+                               "tooltip": "裁切填满=整图铺满、无灰边，适合 img2img；"
+                                          "完整保留=整图可见、边缘补灰"}),
+            },
+            "optional": {
+                "position": (POSITIONS, {"default": "居中",
+                                         "tooltip": "裁切/补边时人物贴在哪个位置"}),
+                "trim": (TRIMS, {"default": "自动去黑边(推荐)",
+                                 "tooltip": "先去掉源图自带的黑边/白边 padding"}),
+                "size_multiple": ("INT", {"default": 16, "min": 8, "max": 64, "step": 8,
+                                          "advanced": True,
+                                          "tooltip": "宽高对齐到几的倍数。MOSS 必须 16；其他模型 8 即可"}),
+                "target_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 16,
+                                         "advanced": True, "tooltip": "仅 aspect=自定义 时生效"}),
+                "target_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 16,
+                                          "advanced": True, "tooltip": "仅 aspect=自定义 时生效"}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "IMAGE", "STRING")
+    RETURN_NAMES = ("latent", "prepared_image", "info")
+    FUNCTION = "prep"
+    CATEGORY = "image/Shanggu 扩图"
+    DESCRIPTION = ("图生图(img2img)预处理：整图裁切/缩放到目标尺寸并 VAE 编码成 latent，"
+                   "不带 mask。接 KSampler 的 latent_image，denoise 控制重绘强度"
+                   "（0.35~0.5 保留多，0.6~0.7 改造多）。MOSS 用本节点时 size_multiple=16。"
+                   "和「扩图→Latent」不同：那个只重绘灰边、原图不动；这个整图重绘。")
+
+    def prep(self, image, vae, aspect, long_side, fit,
+             position="居中", trim="自动去黑边(推荐)", size_multiple=16,
+             target_width=0, target_height=0):
+        tw, th = _plural_to_wh_ex(aspect, long_side, target_width, target_height,
+                                  align=int(size_multiple or 16))
+        do_trim = str(trim).startswith("自动")
+        cover = str(fit).startswith("裁切")
+        latents, prepped, infos = [], [], []
+        for i in range(image.shape[0]):
+            arr = (image[i].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            src = Image.fromarray(arr)
+            try:
+                src = ImageOps.exif_transpose(src)
+            except Exception:
+                pass
+            orig_size = list(src.size)
+            cut = [0, 0, 0, 0]
+            if do_trim:
+                src, cut, _colors = _trim_solid_border(src)
+            canvas, geo = (_fit_cover_canvas if cover else _fit_contain_canvas)(
+                src, tw, th, position, (128, 128, 128)
+            )
+            pixels = torch.from_numpy(
+                np.array(canvas, dtype=np.float32) / 255.0
+            ).unsqueeze(0)
+            # 保险：按 VAE 压缩率裁到整数倍（_plural_to_wh_ex 已对齐 8/16，正常不会触发）
+            ds = max(1, int(getattr(vae, "spacial_compression_encode", lambda: 8)()))
+            ph = (pixels.shape[1] // ds) * ds   # shape[1] = 高
+            pw = (pixels.shape[2] // ds) * ds   # shape[2] = 宽
+            pixels = pixels[:, :ph, :pw, :].contiguous()
+            t = vae.encode(pixels)
+            # 关键：不带 noise_mask，KSampler 对整张 latent 按 denoise 重绘
+            latents.append({"samples": t})
+            prepped.append(pixels)
+            infos.append({
+                "index": i, "source_original": orig_size,
+                "trim_cut": cut, "target": [pw, ph], "fit": geo["mode"],
+                "note": "img2img: denoise 0.35~0.5 保留多 / 0.6~0.7 改造多 / >0.75 放飞",
+            })
+        return (
+            latents[0] if len(latents) == 1 else {"samples": torch.cat([l["samples"] for l in latents], 0)},
+            torch.cat(prepped, 0),
+            __import__("json").dumps(infos, ensure_ascii=False),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "ShangguImageExpandToLatent": ShangguImageExpandToLatent,
+    "ShangguImagePrepForImg2Img": ShangguImagePrepForImg2Img,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ShangguImageExpandToLatent": "图像扩图→Latent (Shanggu)",
+    "ShangguImagePrepForImg2Img": "图像重绘准备→Latent img2img (Shanggu)",
 }

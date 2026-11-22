@@ -22,4 +22,4 @@ WEB_DIRECTORY = "./js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取 / 图像扩图→Latent")
+print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取 / 图像扩图→Latent / 图像重绘准备→Latent")
