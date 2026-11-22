@@ -49,6 +49,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | 运行 | 面板「▶ 运行(N 次)」与 ComfyUI 原生 Run 走同一条链路，用哪个都行；提交成功后自动清空选区 |
 | 站点兜底 | Cookie / UA / Referer / HTTP 或 SOCKS5 代理、自定义正则、粘贴源码、浏览器桥接书签 |
 | 尺寸统一 | 等比缩放+填充、居中裁剪、直接拉伸、保持原尺寸（默认统一到 1024×1024，避免网页原图过大撑爆显存） |
+| 角色参考整图重绘 | 新增 `ShangguCharRefScene`：原图人物当参考 + Qwen 场景提示词 → 整图从头生成，无 mask、无接缝、不多手脚，是解决「竖图转横图边缘不和谐」的推荐方案 |
 
 ---
 
@@ -59,7 +60,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
    ComfyUI/custom_nodes/ComfyUI-Shanggu-WebGallery/
    ```
 2. 重启 ComfyUI（或浏览器 **Ctrl+F5** 强制刷新，扩展 JS 是动态扫描的）。
-3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
+3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）、**角色参考整图重绘**（`ShangguCharRefScene`，推荐）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
 
 无需 `pip install`：核心依赖 `aiohttp`、`PIL`、`numpy`、`torch` 都是 ComfyUI 自带的。
 
@@ -188,9 +189,61 @@ person, people, human, man, woman, child, face, body, hands, feet, arms, legs, f
 
 如果原图边缘就是被截断的手 / 脚（尤其贴着左右边），模型必然从断口续写。用 `vertical_crop=0.1~0.2` 先把上下断肢裁掉再扩，或选图时避开这种构图——**断肢不在边缘，模型就没有续写的入口**。
 
+### 角色参考整图重绘 `ShangguCharRefScene`（多手脚 / 边缘不和谐的终极解法）
+
+> **这是目前效果最好的方案，优先用这个。** 上面那个 `图像扩图→Latent`（mask 扩图）会出现多手脚、接缝、边缘不和谐——这是 mask 架构的先天缺陷：模型不知道哪是人、哪是背景，只看到断掉的皮肤像素，就按统计规律往外续写第二只手。调填充色、denoise、mask_grow 都只是缓解，治不了根。
+
+本节点**彻底丢掉 mask**：把整张图从头生成，人物身份由 CharRef LoRA 锁住，场景由你的提示词决定。**没有「原图区 / 扩展区」之分，所以根本没有接缝这个概念。**
+
+配合你的工作流：用 Qwen 看图写出场景提示词 → 贴进本节点 → 接 KSampler，一步出 16:9 成图。
+
+**节点做的事**（全部封装，你不用管）：
+1. 原图自动去黑边、缩放到参考尺寸（`ref_max_side`，16GB 建议 768）
+2. 自动加载 `charref` 角色参考 LoRA（列表里已排最前，默认选中）
+3. 用 ComfyUI 内置 `TextEncodeMOSSImageEdit` 把参考图编成 latent + 视觉 token，并在提示词前自动加触发句 `Same character and art style as Picture 1.`
+4. negative 按 CharRef 规定用同一个编码器 + 空提示词
+5. 输出 `16:9`（边长对齐 16，MOSS 要求）的空 latent
+
+**接线（就这么几根）：**
+
+```
+LoadImage / 图库节点 ── image ──┐
+Load Diffusion Model(moss) ── model ──┤
+Load CLIP(qwen3.5, 类型 moss_image) ── clip ──┤
+Load VAE(flux2-vae) ── vae ──┤
+                              ↓
+                    角色参考整图重绘 (Shanggu)
+                      prompt = 你的场景提示词
+                      model / positive / negative / latent
+                              ↓ 分别接四根
+                     KSampler（denoise = 1.0！）
+                              ↓
+                     VAEDecode → SaveImage
+```
+
+**参数要点：**
+
+| 输入 | 默认 | 作用 |
+| --- | --- | --- |
+| `prompt` | 示例句 | Qwen 看图写的场景描述；`auto_prefix` 会自动补触发句，不用你手写 |
+| `charref_lora` | 自动选中 charref | 角色一致性 LoRA，找不到会提示 |
+| `lora_strength` | 1.0 | 人物不像可加到 1.2~1.4 |
+| `image_strength` | 1.0 | 参考图权重，越大越像原图人物；>1 会强化 |
+| `aspect` / `long_side` | 16:9 / 1024 | 成图比例与长边；显存紧保持 1024 |
+| `ref_max_side` | 768 | 参考图最长边；越小越省显存、身份细节略少 |
+| `trim` | 自动去黑边 | 去掉源图自带的黑边 |
+
+**关键提醒：**
+- **KSampler 的 denoise 必须是 `1.0`**——整图从头生成，调低反而会出怪图
+- 采样用 MOSS 官方参数：50 步 / CFG 3 / euler + sgm_uniform / SkipLayerGuidance 第 22 层
+- 一次只锁一个人物（Picture 1）；CharRef v2 偏动漫 / 插画，写实照片的脸保持会弱一些
+- 依赖 ComfyUI ≥ 0.43（内置 `TextEncodeMOSSImageEdit`），你的 0.45 已满足
+
+如果人物不像，优先调 `lora_strength`（1.0→1.3）和 `image_strength`（1.0→1.5），并在提示词里补几个外貌词（发色、眼睛颜色、关键服装）。
+
 ### 图像重绘准备→Latent img2img `ShangguImagePrepForImg2Img`
 
-> **先读这段再决定用哪个节点。** 如果你的目标是「9:16 竖图 → 16:9 横图，人物要保留，左右两侧生成自然背景」，**请用上面的 `图像扩图→Latent` 节点，不要用本节点**。
+> **先读这段再决定用哪个节点。** 如果你的目标是「9:16 竖图 → 16:9 横图，人物要保留，左右两侧生成自然背景」，**优先用上面的 `角色参考整图重绘`**；只有当你要的是「保留原图像素、只整体轻微重绘」时才考虑本节点。
 >
 > 原因（MOSS 上实测）：`denoise` 不是"重绘百分比"，而是"从噪声调度表哪一层起步"。
 > - denoise 低（0.2~0.4）：起始噪声太低 → 几乎等于 VAE 重建，**你填什么底色，成图就原样出什么**（边缘拉伸出条纹、模糊出模糊）。
