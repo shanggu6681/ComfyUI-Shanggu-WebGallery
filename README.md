@@ -151,6 +151,43 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 
 > 本节点输出的是 latent，**不是** IMAGE，因此它放在 VAE 编码那一步的位置，用不到也请删掉原来的「缩放图像 / VAE Encode」，别重复接线。
 
+#### 多手脚 / 接缝衔接（重要，别再走弯路）
+
+扩图最常见的两个毛病，成因不同、解法也不同：
+
+| 毛病 | 成因 | 解法 |
+| --- | --- | --- |
+| 扩出来**多一套手脚或多一个人** | 提示词描述了人物；或原图断肢正贴在 mask 边界，模型按「肢体从这里延伸」的先验去补全 | **提示词只写背景 + 负面词压人物**；`mask_grow` 调小 |
+| 原图和扩展区之间有**硬边 / 色差** | 两区分别生成，交界没融合 | 第二步**整体低 denoise 融合** |
+
+**第一步：只让扩展区生长背景**
+
+positive（只写环境，**绝不写人物**）：
+```
+seamless background continuation, sky, ocean, natural lighting, consistent color grading, film grain, highly detailed
+```
+把 `sky, ocean` 换成你原图的实际场景（街道 / 森林 / 室内）。
+
+negative（重点是压住人物和肢体）：
+```
+person, people, human, man, woman, child, face, body, hands, feet, arms, legs, fingers, extra limbs, duplicated limbs, extra people, character, figure, watermark, text
+```
+
+- `mask_grow`：默认 `8` → 改 **`2~4`**。膨胀太大会让模型改动到原图边缘的断肢，直接触发「续写第二只手」。
+- denoise 用 **`1.0`**：扩展区是从噪声全新生成的，低了补不满。
+- 这一步原图区 `mask=0` 完全不参与扩散，扩展区只长背景 → **不会有多手脚**。
+
+**第二步（可选）：整体轻融合消接缝**
+
+把第一步的 `VAEDecode` 结果接回 `VAEEncode`，再进第二个 KSampler：
+- positive 写完整描述（人物 + 背景）；negative 常规负面词 + `extra limbs, extra hands, duplicated people`
+- **denoise `0.3~0.4`**：让接缝柔和、色调统一，人物只轻微变化
+- 如果这一步又冒出手脚（denoise 让原图区也参与了），降到 `0.25`，或干脆跳过第二步只用第一步的结果
+
+**再补一招：先别让断肢贴边**
+
+如果原图边缘就是被截断的手 / 脚（尤其贴着左右边），模型必然从断口续写。用 `vertical_crop=0.1~0.2` 先把上下断肢裁掉再扩，或选图时避开这种构图——**断肢不在边缘，模型就没有续写的入口**。
+
 ### 图像重绘准备→Latent img2img `ShangguImagePrepForImg2Img`
 
 > **先读这段再决定用哪个节点。** 如果你的目标是「9:16 竖图 → 16:9 横图，人物要保留，左右两侧生成自然背景」，**请用上面的 `图像扩图→Latent` 节点，不要用本节点**。
