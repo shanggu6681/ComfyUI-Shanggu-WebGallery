@@ -97,6 +97,24 @@ def _resolve_lora(requested, keyword):
     return requested
 
 
+def _vae_decode(vae, latent):
+    """兼容 ComfyUI 两种 VAEDecode 参数顺序：
+    新版 0.4x 是 decode(self, vae, samples)，旧版是 decode(self, samples, vae)。
+    用检查参数名判断，避免再次踩坑。返回 IMAGE tensor。
+    """
+    import inspect
+    import nodes as comfy_nodes
+    fn = comfy_nodes.VAEDecode().decode
+    try:
+        # fn 是绑定方法，signature 里已去掉 self，第一个参数就是 vae 或 samples
+        first = next(iter(inspect.signature(fn).parameters.keys()))
+        if first == "vae":
+            return fn(vae, latent)[0]
+    except (ValueError, TypeError, StopIteration):
+        pass
+    return fn(latent, vae)[0]
+
+
 def _align32(n: int) -> int:
     return max(32, int(round(n / 32.0)) * 32)
 
@@ -261,7 +279,7 @@ class ShangguQwenOutpaintDraft:
             sampled = comfy_nodes.KSampler().sample(
                 model, (int(seed) + i) & 0xffffffffffffffff, steps, cfg,
                 "euler", "simple", positive, negative_cond, latent, 1.0)[0]
-            draft = comfy_nodes.VAEDecode().decode(sampled, vae)[0]
+            draft = _vae_decode(vae, sampled)
 
             drafts.append(draft)
             refs.append(ref)
