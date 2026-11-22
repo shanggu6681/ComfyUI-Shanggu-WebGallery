@@ -321,7 +321,8 @@ class ShangguImageExpandToLatent:
         )
 
 
-FITS = ["裁切填满(推荐,无留白)", "完整保留(补灰边)"]
+FITS = ["完整保留(内容不裁切,推荐)", "完整保留(补灰边)", "裁切填满(无留白,会裁上下)"]
+PADS = ["边缘延展(推荐)", "中性灰", "黑色", "白色"]
 
 
 def _plural_to_wh_ex(aspect: str, long_side: int, w: int, h: int, align: int = 16) -> tuple[int, int]:
@@ -384,22 +385,49 @@ def _fit_cover_canvas(src: Image.Image, tw: int, th: int, position: str,
                     "crop_px": [x, y], "mode": "cover"}
 
 
+def _edge_extend_rgb(r: Image.Image, tw: int, th: int, cx: int, cy: int) -> Image.Image:
+    """用源图四边像素把空区延展铺满，再在 (cx,cy) 贴回原图。
+
+    9:16 → 16:9 时，整图放在中间只占约 32% 宽，左右空区若填纯灰，
+    模型会在灰/图交界处画出硬矩形；用边缘像素延展后，模型看到的是
+    从主体自然延伸出的背景色，重绘成真实场景的概率高得多。
+    """
+    a = np.asarray(r.convert("RGB"), dtype=np.uint8)
+    rh, rw = a.shape[:2]
+    out = np.empty((th, tw, 3), dtype=np.uint8)
+    row = np.empty((rh, tw, 3), dtype=np.uint8)
+    if cx > 0:
+        row[:, :cx, :] = a[:, :1, :]
+    row[:, cx:cx + rw, :] = a
+    if cx + rw < tw:
+        row[:, cx + rw:, :] = a[:, -1:, :]
+    if cy > 0:
+        out[:cy, :, :] = row[:1, :, :]
+    out[cy:cy + rh, :, :] = row
+    if cy + rh < th:
+        out[cy + rh:, :, :] = row[-1:, :, :]
+    return Image.fromarray(out)
+
+
 def _fit_contain_canvas(src: Image.Image, tw: int, th: int, position: str,
-                        fill_rgb: tuple[int, int, int]):
-    """整图可见，短出来的边补纯色。返回 (canvas RGB, geo)。"""
+                        fill_rgb: tuple[int, int, int], pad: str = PADS[0]):
+    """整图可见（不裁内容），短出来的边按 pad 填充。返回 (canvas RGB, geo)。"""
     sw, sh = src.size
     scale = min(tw / float(sw), th / float(sh))
     nw = max(1, int(round(sw * scale)))
     nh = max(1, int(round(sh * scale)))
     r = src.convert("RGB").resize((nw, nh), Image.LANCZOS)
-    canvas = Image.new("RGB", (tw, th), fill_rgb)
     x = tw - nw
     y = th - nh
     cx = 0 if position == "偏左" else (x if position == "偏右" else x // 2)
     cy = 0 if position == "偏上" else (y if position == "偏下" else y // 2)
-    canvas.paste(r, (cx, cy))
+    if str(pad).startswith("边缘"):
+        canvas = _edge_extend_rgb(r, tw, th, cx, cy)
+    else:
+        canvas = Image.new("RGB", (tw, th), fill_rgb)
+        canvas.paste(r, (cx, cy))
     return canvas, {"scale": scale, "resized": [nw, nh], "paste_origin": [cx, cy],
-                    "pad_px": [x, y], "mode": "contain"}
+                    "pad_px": [x, y], "mode": "contain", "pad": pad}
 
 
 class ShangguImagePrepForImg2Img:
@@ -429,8 +457,11 @@ class ShangguImagePrepForImg2Img:
                 "long_side": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 16,
                                       "tooltip": "目标长边像素"}),
                 "fit": (FITS, {"default": FITS[0],
-                               "tooltip": "裁切填满=整图铺满、无灰边，适合 img2img；"
-                                          "完整保留=整图可见、边缘补灰"}),
+                               "tooltip": "完整保留=整图可见、一个像素都不裁（9:16→16:9 必选，"
+                                          "否则人物会被切掉大半）；裁切填满=铺满无空边但会裁掉上下"}),
+                "pad": (PADS, {"default": PADS[0],
+                               "tooltip": "仅 fit=完整保留 时生效。边缘延展=用原图边缘色填满空区，"
+                                          "模型更容易续绘；纯色=填灰/黑/白，可能留下硬边矩形"}),
             },
             "optional": {
                 "position": (POSITIONS, {"default": "居中",
@@ -453,12 +484,14 @@ class ShangguImagePrepForImg2Img:
     CATEGORY = "image/Shanggu 扩图"
     DESCRIPTION = ("图生图(img2img)预处理：整图裁切/缩放到目标尺寸并 VAE 编码成 latent，"
                    "不带 mask。接 KSampler 的 latent_image，denoise 控制重绘强度。"
+                   "默认「完整保留」＋边缘延展：9:16 竖图转 16:9 时整图可见、一个像素不裁，"
+                   "左右空区用原图边缘色填满，避免裁掉人物或留下灰边。"
                    "MOSS-Image 用 denoise 0.18~0.30（高于 0.5 人物会被文字覆盖、画成别的场景）；"
                    "SDXL/Flux 用 0.35~0.6。MOSS 的 size_multiple=16。"
                    "和「扩图→Latent」不同：那个只重绘灰边、原图不动；这个整图重绘。")
 
     def prep(self, image, vae, aspect, long_side, fit,
-             position="居中", trim="自动去黑边(推荐)", size_multiple=16,
+             position="居中", pad=PADS[0], trim="自动去黑边(推荐)", size_multiple=16,
              target_width=0, target_height=0):
         tw, th = _plural_to_wh_ex(aspect, long_side, target_width, target_height,
                                   align=int(size_multiple or 16))
@@ -476,9 +509,10 @@ class ShangguImagePrepForImg2Img:
             cut = [0, 0, 0, 0]
             if do_trim:
                 src, cut, _colors = _trim_solid_border(src)
-            canvas, geo = (_fit_cover_canvas if cover else _fit_contain_canvas)(
-                src, tw, th, position, (128, 128, 128)
-            )
+            if cover:
+                canvas, geo = _fit_cover_canvas(src, tw, th, position, (128, 128, 128))
+            else:
+                canvas, geo = _fit_contain_canvas(src, tw, th, position, (128, 128, 128), pad=pad)
             pixels = torch.from_numpy(
                 np.array(canvas, dtype=np.float32) / 255.0
             ).unsqueeze(0)
@@ -494,6 +528,7 @@ class ShangguImagePrepForImg2Img:
             infos.append({
                 "index": i, "source_original": orig_size,
                 "trim_cut": cut, "target": [pw, ph], "fit": geo["mode"],
+                "pad": geo.get("pad", ""), "content_visible_px": geo["resized"] if not cover else [pw, ph],
                 "note": ("img2img denoise: MOSS(shift5) 0.18~0.30 / SDXL,Flux 0.35~0.60; "
                          "若成图变成文字描述的场景而非原图人物，先把 denoise 降到 0.20"),
             })
