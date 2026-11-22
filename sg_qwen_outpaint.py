@@ -15,10 +15,7 @@
 outpaint LoRA 训练目标就是「灰色区补全、原图区不动」，全图重绘反而没有接缝。
 官方原话：Do not pin the known area with Set Latent Noise Mask.
 
-输出：draft / reference 都是生成后的低像素草图；第三个端口 moss_conditioning 是
-用 MOSS 自己的文本编码器(qwen3.5_9b)重新"看"这张草图编出的 CONDITIONING，
-可直接接 MOSS KSampler 的正面条件，让 MOSS 看懂草图内容、不换人物身份。
-注意：conditioning 不能跨模型——Qwen 的 qwen3vl 空间 MOSS 不认，所以必须用 MOSS 的 clip 重新编码。
+输出的是低像素草图（默认长边 768，draft / reference 两个端口都是这张生成后的图），拿它再去跑 MOSS 做最终风格重绘。
 """
 from __future__ import annotations
 
@@ -154,18 +151,6 @@ LORAS = _fl("loras", [
     "Krea2\\Turbo加速 [1.0-1.0] p_qwen_image_2.1_8step_v0.1-comfyui-T8.safetensors",
 ])
 
-# MOSS 看图编码用：qwen3.5_9b 文本编码器(type=moss_image) + flux2 VAE
-MOSS_CLIPS = _fl("clip", [
-    "qwen3.5_9b_int8_convrot.safetensors",
-    "qwen3.5_9b_w4a8_gptq.safetensors",
-])
-MOSS_VAES = _fl("vae", ["flux2-vae.safetensors"])
-MOSS_EDIT_FORMATS = [
-    "ai-toolkit",                  # 文本编码器看图 + kv_cache
-    "ai-toolkit (kv_cache off)",  # 文本编码器看图 + 每步重算参考
-    "Moss-Image-Edit",            # 文本编码器不看图，靠 VAE reference_latents
-]
-
 
 def _default_choice(options, keyword):
     for name in options:
@@ -217,46 +202,6 @@ def _vae_decode(vae, latent):
     except (ValueError, TypeError, StopIteration):
         pass
     return fn(latent, vae)[0]
-
-
-def _merge_conditioning(conds):
-    """把每张图编出的 CONDITIONING 合并成一个（多图 batch 时）。
-
-    ComfyUI 的 CONDITIONING 是 [(tensor, meta_dict), ...] 结构。
-    单图直接返回；多图时逐段拼接 tensor、沿用第一段的 meta，并合并
-    reference_latents / context_attention_bias 这类带 batch 的附加字段。
-    """
-    if not conds:
-        return []
-    if len(conds) == 1:
-        return conds[0]
-    out = []
-    for seg_idx in range(len(conds[0])):
-        tensors, metas = [], []
-        for c in conds:
-            tensors.append(c[seg_idx][0])
-            metas.append(c[seg_idx][1] if len(c[seg_idx]) > 1 else {})
-        import torch as _torch
-        merged_t = _torch.cat(tensors, dim=0)
-        meta = dict(metas[0])
-        # 合并 reference_latents（列表 → 拼接）
-        if "reference_latents" in metas[0]:
-            refs = []
-            for m in metas:
-                refs.extend(m.get("reference_latents", []))
-            meta["reference_latents"] = refs
-        # 合并 context_attention_bias（沿 batch 拼）
-        if "context_attention_bias" in metas[0]:
-            import torch as _torch
-            biases = []
-            for m in metas:
-                b = m.get("context_attention_bias")
-                if b is not None:
-                    biases.append(b)
-            if biases:
-                meta["context_attention_bias"] = _torch.cat(biases, dim=0)
-        out.append([merged_t, meta])
-    return out
 
 
 def _align32(n: int) -> int:
@@ -346,28 +291,13 @@ class ShangguQwenOutpaintDraft:
                 "turbo_lora": (LORAS, {"default": _default_choice(LORAS, "8step")}),
                 "lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0,
                                             "max": 2.0, "step": 0.05}),
-                # MOSS 看图编码（把草图编成 MOSS 能用的 conditioning）
-                "moss_prompt": ("STRING", {"multiline": True, "default": "",
-                                           "tooltip": "给 MOSS 的编辑指令。留空则纯靠草图视觉信息重绘"}),
-                "moss_clip_name": (MOSS_CLIPS, {"default": _default_choice(MOSS_CLIPS, "qwen3.5_9b_int8"),
-                                                "tooltip": "MOSS 文本编码器 qwen3.5_9b（type=moss_image）——"
-                                                           "必须是它，Qwen 的 clip 编出的条件 MOSS 不认"}),
-                "moss_vae_name": (MOSS_VAES, {"default": _default_choice(MOSS_VAES, "flux2"),
-                                              "tooltip": "flux2-vae，把草图编成参考 latent"}),
-                "moss_edit_format": (MOSS_EDIT_FORMATS, {"default": MOSS_EDIT_FORMATS[0],
-                                                         "tooltip": "MOSS 看图编码格式。ai-toolkit=文本编码器看图；"
-                                                                    "Moss-Image-Edit=靠 VAE 参考 latent"}),
-                "moss_image_strength": ("FLOAT", {"default": 1.0, "min": 0.0,
-                                                  "max": 100.0, "step": 0.05,
-                                                  "tooltip": "MOSS 对草图的注意力强度。1=原样，越大越强调"}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "CONDITIONING")
-    RETURN_NAMES = ("draft", "reference", "moss_conditioning")
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("draft", "reference")
     OUTPUT_TOOLTIPS = ("低像素扩图草图，拿去跑 MOSS 重绘",
-                       "生成后的扩图草图（与 draft 同一张，可直接当参考图用）",
-                       "MOSS 文本编码器看草图编出的正面条件，直接接 MOSS KSampler 的 positive")
+                       "生成后的扩图草图（与 draft 同一张，可直接当参考图用）")
     FUNCTION = "generate"
     CATEGORY = "Shanggu/Image"
 
@@ -391,12 +321,9 @@ class ShangguQwenOutpaintDraft:
                  seed, quality, trim, auto_prefix, custom_width=0,
                  custom_height=0, unet_name=None, clip_name=None,
                  vae_name=None, outpaint_lora=None, turbo_lora=None,
-                 lora_strength=1.0, moss_prompt="", moss_clip_name=None,
-                 moss_vae_name=None, moss_edit_format=None,
-                 moss_image_strength=1.0):
+                 lora_strength=1.0):
         import nodes as comfy_nodes
         from comfy_extras.nodes_qwen import TextEncodeQwenImage21
-        from comfy_extras.nodes_moss_image import TextEncodeMOSSImageEdit
 
         unet_name = unet_name or _default_choice(UNETS, "qwen_image_2.1")
         clip_name = clip_name or _default_choice(CLIPS, "qwen3vl_8b")
@@ -424,14 +351,7 @@ class ShangguQwenOutpaintDraft:
             unet_name, clip_name, vae_name, outpaint_lora, turbo_lora,
             lora_strength, fast)
 
-        # 加载 MOSS 的文本编码器 + VAE（把草图编成 MOSS 能用的 conditioning）
-        moss_clip_name = moss_clip_name or _default_choice(MOSS_CLIPS, "qwen3.5_9b_int8")
-        moss_vae_name = moss_vae_name or _default_choice(MOSS_VAES, "flux2")
-        moss_edit_format = moss_edit_format or MOSS_EDIT_FORMATS[0]
-        moss_clip = comfy_nodes.CLIPLoader().load_clip(moss_clip_name, "moss_image", "default")[0]
-        moss_vae = comfy_nodes.VAELoader().load_vae(moss_vae_name)[0]
-
-        drafts, refs, moss_conds = [], [], []
+        drafts, refs = [], []
         for i in range(image.shape[0]):
             src = _to_pil(image[i])
             if str(trim).startswith("自动"):
@@ -452,18 +372,7 @@ class ShangguQwenOutpaintDraft:
             # reference 端口输出生成后的草图，不再输出生成前的灰底参考图
             refs.append(draft)
 
-            # 用 MOSS 自己的文本编码器重新"看"这张草图 → MOSS 能用的正面条件。
-            # reference_latents 走 VAE，vision token 走 qwen3.5 视觉塔，二者都带图像信息。
-            cond = TextEncodeMOSSImageEdit.execute(
-                clip=moss_clip, prompt=moss_prompt or "",
-                edit_format=moss_edit_format, vae=moss_vae,
-                images={"image_1": draft},
-                image_strength=float(moss_image_strength))[0]
-            moss_conds.append(cond)
-
-        # CONDITIONING 的合并：多个 batch 时把每项的 (tensor, meta) 沿 batch 维拼接
-        merged_cond = _merge_conditioning(moss_conds)
-        return (torch.cat(drafts, 0), torch.cat(refs, 0), merged_cond)
+        return (torch.cat(drafts, 0), torch.cat(refs, 0))
 
 
 NODE_CLASS_MAPPINGS = {
