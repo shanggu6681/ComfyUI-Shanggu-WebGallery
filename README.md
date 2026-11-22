@@ -49,7 +49,8 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | 运行 | 面板「▶ 运行(N 次)」与 ComfyUI 原生 Run 走同一条链路，用哪个都行；提交成功后自动清空选区 |
 | 站点兜底 | Cookie / UA / Referer / HTTP 或 SOCKS5 代理、自定义正则、粘贴源码、浏览器桥接书签 |
 | 尺寸统一 | 等比缩放+填充、居中裁剪、直接拉伸、保持原尺寸（默认统一到 1024×1024，避免网页原图过大撑爆显存） |
-| 角色参考整图重绘 | 新增 `ShangguCharRefScene`：原图人物当参考 + Qwen 场景提示词 → 整图从头生成，无 mask、无接缝、不多手脚，是解决「竖图转横图边缘不和谐」的推荐方案 |
+| Qwen 扩图草图（推荐首选） | `ShangguQwenOutpaintDraft`：源图 + 目标比例 → 低像素 16:9 草图。内部一条链搞定：去黑边 → 灰底画布(#808080) → Qwen2.1 文本编码器看图 → outpaint LoRA 全图重绘（**不用 mask、无接缝、不多手脚**）。拿草图再去跑 MOSS 出最终图 |
+| 角色参考整图重绘 | `ShangguCharRefScene`：MOSS 模型 + 原图人物当参考 + 场景提示词 → 整图从头生成。仅适用于 MOSS 模型 |
 
 ---
 
@@ -60,7 +61,7 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
    ComfyUI/custom_nodes/ComfyUI-Shanggu-WebGallery/
    ```
 2. 重启 ComfyUI（或浏览器 **Ctrl+F5** 强制刷新，扩展 JS 是动态扫描的）。
-3. 双击画布搜索 **网页图库选图器**（`ShangguWebImageGallery`）、**角色参考整图重绘**（`ShangguCharRefScene`，推荐）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
+3. 双击画布搜索 **Qwen扩图草图→IMAGE**（`ShangguQwenOutpaintDraft`，竖图转横图首选）、**网页图库选图器**（`ShangguWebImageGallery`）、**角色参考整图重绘**（`ShangguCharRefScene`，MOSS 专用）、**图像扩图→Latent**（`ShangguImageExpandToLatent`）或 **图像重绘准备→Latent img2img**（`ShangguImagePrepForImg2Img`）。新增节点若没出现，重启一次 ComfyUI 即可。
 
 无需 `pip install`：核心依赖 `aiohttp`、`PIL`、`numpy`、`torch` 都是 ComfyUI 自带的。
 
@@ -113,6 +114,43 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 ### 图库信息提取 `ShangguGalleryInfo`
 
 把 `info_json` 里指定字段（如 `prompt`、`url`）按索引拆成 `STRING`，方便直接接文本编码节点做「看图写提示词」。
+
+### Qwen 扩图草图 `ShangguQwenOutpaintDraft`（竖图转横图首选）
+
+**把 9:16 竖图变成 16:9 横图、人物完整不变形、左右是自然场景——一个节点直接出草图。** 内部封装了 ausboss `Qwen-Image-2.1-Outpaint-LoRA` 的官方全链路，你只接一张图 + 选目标比例即可，不用自己搭十几个节点。
+
+接线（整个扩图阶段就这一个节点）：
+
+```
+图库选图器 / LoadImage
+   └─ image → Qwen扩图草图 (Shanggu)
+                ├─ draft     → SaveImage（低像素草图，长边默认 768）
+                ├─ reference → PreviewImage（灰底参考图，调试用）
+                └─ info      → （尺寸/比例明细 JSON）
+```
+
+然后拿 `draft` 这张 16:9 草图，去你的 **MOSS 工作流**当输入重绘成最终风格。
+
+**它是怎么解决多手脚 / 接缝 / 黑边的**（这是之前所有方案失败的根因）：
+
+| 之前失败的做法 | 本节点做法 |
+|---|---|
+| mask 扩图：只重绘扩展区 → 模型把断肢「续写」成第二只手，接缝有硬边 | **不用 mask**，Qwen outpaint LoRA 训练目标就是「灰区补全、原图区不动」，全图重绘，无矩形接缝 |
+| img2img 直接重绘：调低 denoise 复刻填充条纹，调高被文字带跑 | 参考图是**纯灰 #808080** 底 + 文本编码器直接看图（outpaint LoRA 的规定输入），denoise 固定 1.0 |
+| 拉伸 / 边缘延展填充 | 源图**等比缩放、整图完整保留**，左右空区填纯灰交给模型生成 |
+
+节点内部依次做：自动去黑边 → 等比缩放贴到目标比例灰画布（32 倍数对齐）→ 加载本地 Qwen2.1 模型（`qwen_image_2.1_int8_convrot` + `qwen3vl_8b_int8_convrot` + `qwen_image_2.1_vae_bf16`）→ 加载 `画面扩展 qwen-image-2.1-outpaint-v2` LoRA → `TextEncodeQwenImage21` 编码灰底参考图 → `KSampler` 25 步 / CFG 1 / euler / simple / denoise 1 → `VAEDecode` 出图。**加载器走 ComfyUI 缓存，不会重复占显存。**
+
+参数要点：
+
+- `aspect`：目标比例，选 **16:9**；`draft_long_side` 草图长边默认 **768**（只是草图，够用且快）
+- `prompt`：**用 Qwen3-VL 看图写场景描述**（画面里有什么、背景是什么），节点会自动在前面加官方触发句 `Outpaint the image: replace the solid gray areas...`；留空也能跑，但写了扩展区更贴合
+- `quality`：`质量(25步)`（默认，官方参数）或 `快速(8步+turbo)`（叠加本地 8-step turbo LoRA，牺牲一点质量换速度）
+- 模型文件名都是下拉可选，默认已选中本机确认存在的版本；如果你的文件名不同，下拉里改即可
+
+**前置条件**：本地需有上面的 Qwen2.1 模型 + 画面扩展 outpaint LoRA（你的环境已齐全）。这一步产出的是**低像素草图**，最终的清晰度、风格由后面的 MOSS 工作流负责——两者分工，各用其所长。
+
+---
 
 ### 图像扩图→Latent `ShangguImageExpandToLatent`
 

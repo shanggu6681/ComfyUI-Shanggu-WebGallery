@@ -19,10 +19,13 @@ NODE_DISPLAY_NAME_MAPPINGS.update(sg_outpaint.NODE_DISPLAY_NAME_MAPPINGS)  # noq
 import sg_charref  # noqa: E402
 NODE_CLASS_MAPPINGS.update(sg_charref.NODE_CLASS_MAPPINGS)  # noqa: E402
 NODE_DISPLAY_NAME_MAPPINGS.update(sg_charref.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
+import sg_qwen_outpaint  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_qwen_outpaint.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_qwen_outpaint.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
 import sg_server  # noqa: E402,F401  (导入即注册 /sg_gallery/* 路由)
 
 WEB_DIRECTORY = "./js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取 / 图像扩图→Latent / 图像重绘准备→Latent / 角色参考整图重绘")
+print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / 图库信息提取 / 图像扩图→Latent / 图像重绘准备→Latent / 角色参考整图重绘 / Qwen扩图草图")
