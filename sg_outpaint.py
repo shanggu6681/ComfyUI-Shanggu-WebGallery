@@ -28,6 +28,93 @@ from PIL import Image, ImageOps
 ASPECTS = ["16:9", "3:2", "4:3", "1:1", "3:4", "9:16", "2:1", "21:9", "自定义"]
 POSITIONS = ["居中", "偏左", "偏右", "偏上", "偏下"]
 FILLS = ["中性灰(推荐)", "黑色", "白色"]
+TRIMS = ["自动去黑边(推荐)", "不去黑边"]
+
+
+def _trim_solid_border(img: Image.Image, tol: int = 12,
+                       min_frac: float = 0.005) -> tuple[Image.Image, list, dict]:
+    """去掉源图四周自带的纯色边（黑边/白边/灰边）。
+
+    图库下载的图经常被人为 pad 成固定比例，四周留一圈纯黑（letterbox）。
+    这圈黑边如果留在原图区（mask=0，保留不重绘），采样器不会碰它，
+    成图就会带着黑边——这正是用户看到的「灰色和人物之间夹着黑条」。
+
+    只处理「整条边几乎全是同一纯色」的情况，避免误伤正常暗背景：
+    对上下左右各扫描若干行/列，若某条边 >=95% 的像素都接近同一颜色
+    （且该颜色很暗/很亮，即亮度 <40 或 >215），就认为它是 padding 并裁掉。
+    返回 (裁后的图, [left,top,right,bottom] 各边裁掉的像素, 每边颜色)。
+    """
+    a = np.asarray(img.convert("RGB")).astype(np.int16)
+    h, w, _ = a.shape
+    cut = [0, 0, 0, 0]          # left, top, right, bottom
+    colors: dict[str, list] = {}
+
+    def edge_uniform(strip: np.ndarray) -> tuple[bool, list]:
+        """strip: (N, W, 3) 或 (H, N, 3)。返回是否整条为纯色及该颜色。
+
+        判定严格，避免误伤暗色照片：
+        * 该条边 >=99% 像素与中位色差 <=tol
+        * 颜色本身必须极暗(亮度<18)或极亮(亮度>238)——padding 通常是纯黑/纯白
+        * 相邻 RGB 三通道差异也要小（纯灰阶），排除有色彩的暗背景
+        """
+        flat = strip.reshape(-1, 3)
+        med = np.median(flat, axis=0)
+        close = (np.abs(flat - med).max(axis=1) <= tol)
+        lum = float(med.mean())
+        spread = float(med.max() - med.min())  # 三通道是否接近（灰阶）
+        uniform = (close.mean() >= 0.99 and spread <= 6
+                   and (lum < 18 or lum > 238))
+        return uniform, [int(round(v)) for v in med]
+
+    max_side = min(h, w) // 4  # 单边最多裁 1/4，防止误裁整图
+
+    # 左边：从左往右逐列
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[:, i:i + 1, :])
+        if not ok:
+            break
+        colors.setdefault("left", col)
+        i += 1
+    cut[0] = i
+
+    # 右边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[:, w - 1 - i:w - i, :])
+        if not ok:
+            break
+        colors.setdefault("right", col)
+        i += 1
+    cut[2] = i
+
+    # 上边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[i:i + 1, :, :])
+        if not ok:
+            break
+        colors.setdefault("top", col)
+        i += 1
+    cut[1] = i
+
+    # 下边
+    i = 0
+    while i < max_side:
+        ok, col = edge_uniform(a[h - 1 - i:h - i, :, :])
+        if not ok:
+            break
+        colors.setdefault("bottom", col)
+        i += 1
+    cut[3] = i
+
+    l, t, r, b = cut
+    # 至少要裁掉一点（>=0.5% 边长）才认为有效；裁完必须还剩足够画面
+    if (l + r) / w < min_frac and (t + b) / h < min_frac:
+        return img, [0, 0, 0, 0], {}
+    if w - l - r < 32 or h - t - b < 32:
+        return img, [0, 0, 0, 0], {}
+    return img.crop((l, t, w - r, h - b)), cut, colors
 
 
 def _plural_to_wh(aspect: str, long_side: int, w: int, h: int) -> tuple[int, int]:
@@ -53,27 +140,44 @@ def _plural_to_wh(aspect: str, long_side: int, w: int, h: int) -> tuple[int, int
 
 
 def _compose_canvas(src: Image.Image, tw: int, th: int, crop: float,
-                    position: str, fill_rgb: tuple[int, int, int]):
-    """返回 (canvas RGB, mask L)。mask 白=要重绘(扩展区)，黑=保留(原图区)。
+                    position: str, fill_rgb: tuple[int, int, int],
+                    trim: bool = True):
+    """返回 (canvas RGB, mask L, geo)。mask 白=要重绘(扩展区)，黑=保留(原图区)。
 
-    src 先按 crop 裁掉上下（各裁 crop 比例），再等比缩放到尽量贴合目标画布，
-    不拉伸；短出来的维度由 offset_position 决定原图偏向哪边，其余为扩图区。
+    处理顺序（关键）：
+      0) 先去掉源图自带的纯色黑边（pad）——否则黑边会留在保留区，成图带黑边
+      1) 按 crop 裁掉上下（各裁 crop 比例）
+      2) 等比缩放到「长边对齐目标短边」，不拉伸，居中（或按 position 偏移）
+      3) 其余区域作为扩图区，填 fill 颜色并标进 mask
     """
+    orig_size = src.size
+    trim_info: dict = {"cut": [0, 0, 0, 0], "colors": {}}
+    if trim:
+        src, cut, colors = _trim_solid_border(src)
+        trim_info = {"cut": cut, "colors": colors}
     sw, sh = src.size
-    # 1) 裁切上下：各裁掉 crop 比例（0~0.45），让原图更接近目标比例
+    # 1) 裁切上下：各裁掉 crop 比例（0~0.45），让原图更接近目标比例、人像更充盈。
+    #    但裁太多会让图比画布还"横"——此时若硬贴合高度就必然左右溢出。
+    #    所以把有效 crop 限制在「裁完后高度贴合画布时宽度仍不超过画布」的上限，
+    #    保证永远是「高度贴合 + 左右扩图」，不拉伸、不出现上下留空。
     crop = max(0.0, min(0.45, float(crop)))
+    if sw > 0 and sh > 0:
+        min_h = sw * th / float(tw)          # 裁后至少要这么高，宽度才不超画布
+        crop_cap = max(0.0, (1.0 - min_h / sh) / 2.0)
+        crop = min(crop, crop_cap)
     if crop > 0:
         top = int(round(sh * crop))
         bottom = sh - top
         if bottom - top >= 8:
             src = src.crop((0, top, sw, bottom))
             sh = src.height
-    # 2) 等比缩放：scale 取「能装进画布」的最小值（contain），绝不放大到溢出，
-    #    也绝不拉伸。竖图 9:16 -> 横画布 16:9 时，高度贴合、左右留空。
-    scale = min(tw / sw, th / sh)
-    nw = max(8, int(round(sw * scale)))
-    nh = max(8, int(round(sh * scale)))
-    nw, nh = min(nw, tw), min(nh, th)
+    # 2) 等比缩放：源图是竖的、目标 canvas 是横的，所以固定「高度贴合画布」，
+    #    宽度按比例算——绝不拉伸、绝不出现上下留空（上下留空=纵向黑边）。
+    #    裁掉越多上下，nw 越大、人像越充盈；nw 超过画布宽时再夹到 tw。
+    scale = th / float(sh)
+    nh = th
+    nw = int(round(sw * scale))
+    nw = max(8, min(nw, tw))
     r = src.convert("RGB").resize((nw, nh), Image.LANCZOS)
 
     # 3) 放到画布上；短出来的维度按 position 决定偏移
@@ -94,7 +198,8 @@ def _compose_canvas(src: Image.Image, tw: int, th: int, crop: float,
     # 原图区 mask 置 0（保留），扩展区保持 255（重绘）
     mask.paste(0, (x, y, x + nw, y + nh))
     return canvas, mask, {"x": x, "y": y, "nw": nw, "nh": nh,
-                          "src_size": (sw, sh), "crop": crop}
+                          "src_size": (sw, sh), "orig_size": orig_size,
+                          "crop": crop, "trim": trim_info}
 
 
 class ShangguImageExpandToLatent:
@@ -120,6 +225,9 @@ class ShangguImageExpandToLatent:
                                  "tooltip": "扩图区的底色。中性灰是 inpaint 的标准， latent 编码最稳"}),
                 "mask_grow": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1,
                                       "tooltip": "把 mask 向原图内侧膨胀几像素，让接缝更自然；0=不膨胀"}),
+                "trim": (TRIMS, {"default": "自动去黑边(推荐)",
+                                 "tooltip": "自动去掉源图自带的纯黑/纯白 padding 边。"
+                                            "图库图常被 pad 成 9:16，那圈黑边若不去掉会被当成「保留区」原样留在成图里"}),
                 "target_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
                                          "advanced": True, "tooltip": "仅当 aspect=自定义 时生效"}),
                 "target_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
@@ -131,13 +239,14 @@ class ShangguImageExpandToLatent:
     RETURN_NAMES = ("latent", "expanded_image", "expand_mask", "info")
     FUNCTION = "expand"
     CATEGORY = "image/Shanggu 扩图"
-    DESCRIPTION = ("竖图扩成横图并直接输出可采样 latent：可选裁切上下、等比不拉伸、左右扩图。"
+    DESCRIPTION = ("竖图扩成横图并直接输出可采样 latent：自动去掉源图黑边、可选裁切上下、"
+                   "等比不拉伸、高度贴合左右扩图（无黑边）。"
                    "把 latent 接 KSampler 的 latent_image，扩展区会被文本提示补全，原图区保持不变。"
                    "建议 denoise 0.9~1.0；可在 CONTROL_Apply Mask 后接 InpaintModelConditioning 获得更好接缝。")
 
     def expand(self, image, vae, aspect, long_side, vertical_crop,
                position="居中", fill="中性灰(推荐)", mask_grow=8,
-               target_width=0, target_height=0):
+               trim="自动去黑边(推荐)", target_width=0, target_height=0):
         tw, th = _plural_to_wh(aspect, long_side, target_width, target_height)
         fill_rgb = {"黑色": (0, 0, 0), "白色": (255, 255, 255)}.get(fill, (128, 128, 128))
 
@@ -150,8 +259,9 @@ class ShangguImageExpandToLatent:
                 src = ImageOps.exif_transpose(src)
             except Exception:
                 pass
+            do_trim = str(trim).startswith("自动")
             canvas, mask_img, geo = _compose_canvas(
-                src, tw, th, vertical_crop, position, fill_rgb
+                src, tw, th, vertical_crop, position, fill_rgb, trim=do_trim
             )
 
             # --- 编码成 latent，参考 ComfyUI 内置 VAEEncodeForInpaint ---
@@ -195,6 +305,8 @@ class ShangguImageExpandToLatent:
             masks.append(m.squeeze(1))  # 1 x H x W（ComfyUI MASK 的 BxHxW 形状）
             infos.append({
                 "index": i, "source": list(geo["src_size"]),
+                "source_original": list(geo["orig_size"]),
+                "trim_cut": geo["trim"]["cut"], "trim_colors": geo["trim"]["colors"],
                 "target": [tw, th], "crop": geo["crop"],
                 "paste": [geo["x"], geo["y"], geo["nw"], geo["nh"]],
                 "expanded_px": int(tw * th - geo["nw"] * geo["nh"]),
