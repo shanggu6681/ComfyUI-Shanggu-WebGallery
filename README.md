@@ -159,13 +159,13 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 | --- | --- | --- |
 | 目标 | 补出新区域，原图像素一动不动 | 整张重绘成新图，人物/风格大致保持 |
 | mask | 带 `noise_mask`，只重绘灰边 | **不带 mask**，整图按 denoise 重绘 |
-| denoise | 0.9~1.0（要补满灰边） | **0.35~0.5 保留多 / 0.6~0.7 改造多 / >0.75 放飞** |
+| denoise | 0.9~1.0（要补满灰边） | **MOSS：0.18~0.30；SDXL/Flux：0.35~0.60**（MOSS 超过 0.5 会被文字带跑，人物变场景） |
 | 尺寸 | 高度贴合、左右补灰 | **整图裁切/缩放铺满目标尺寸，无灰边** |
 
 工作流只有一条链：
 
 ```
-图库节点(或LoadImage) → 本节点(aspect / long_side) → KSampler(latent_image, denoise 0.5) → VAEDecode → SaveImage
+图库节点(或LoadImage) → 本节点(aspect / long_side) → KSampler(latent_image, MOSS denoise 0.22) → VAEDecode → SaveImage
 ```
 
 - `fit` 选 **`裁切填满(推荐,无留白)`**：等比放大后按 `position` 裁掉多余部分，画布每个像素都有内容可重绘，最适合 img2img；选 `完整保留(补灰边)` 则整图可见、边缘补灰。
@@ -173,6 +173,17 @@ ComfyUI 的一次运行就是一张**静态 DAG**：节点只能往前执行，�
 - 输出 `latent` **不带 `noise_mask`**，所以 KSampler 的 denoise 直接控制整图重绘强度；`prepared_image` 可接 PreviewImage 先看裁切构图对不对。
 
 **关于 MOSS**：MOSS-Image 本体是纯文生图，**原生不认参考图**（模板里的 `ref_image` 只喂给可选的 prompt enhancer，模型读不到图像内容）。所以要"看着原图重绘"就必须走本节点的 img2img 通道，让原图 latent 当构图+风格底子。MOSS 采样建议：**50 steps / CFG 3 / euler + sgm_uniform / shift 5（ModelSamplingAuraFlow multiplier 1）/ skip layer guidance layer 22**，VAE 用 `flux2-vae`。显存方面 int8 主模型约 5.4GB + Qwen3.5 文本编码器约 7.3GB，16GB 卡能跑但较紧。
+
+#### 排查：人物图被画成别的场景（例如公交站台）
+
+MOSS 是文生图模型，img2img 时**文字的牵引远强于 latent**。denoise 一高，起始 sigma 已经接近纯噪声，原图 latent 几乎不起作用，模型就照着提示词重画一个新场景。按这个顺序排查：
+
+1. **`prepared_image` 接 PreviewImage**：先确认节点裁出来的图里人物还在。竖图 9:16 → 16:9 默认 `裁切填满` 只保留中间约 31% 的高度，人物在画面上/下方就会被切掉；改 `position` 为 `偏上`/`偏下`，或改 `fit=完整保留(补灰边)`，或把目标比例换成 3:2 / 4:3。
+2. **denoise 降到 0.18~0.30**：先固定 **0.20** 跑一张；人物回来了再一点点往上加，最多 0.35。之前建议的 0.5 对 MOSS 太高，已更正。
+3. **确认 KSampler 接的是本节点的 `latent`**，不是 `EmptyLatentImage`，也不是旧「扩图→Latent」的输出。
+4. **提示词里明确写人物**：以 `同一人物，同样的服装和发型，` 开头再写场景；负面提示词加 `different person, no person, change character, bus stop, billboard`（把不想要的具体场景词也写进去）。
+5. **VAE 必须是 `flux2-vae`**（或官方配套的小 VAE）；用错 VAE 会让 latent 编码失效，表现同样是"完全看不出原图"。
+6. 仍不行就先跑通纯文生图基线（官方工作流、1024×1024、denoise 1），确认模型/采样器本身正常，再换回本节点。
 
 > 想要更强的"人物长得像"、跨场景保持同一角色，可以另装社区方案 `MOSS-Image CharRef v2`（edit LoRA + ostris 的 edit 节点，参考图接 `image1`，提示词以 `Same character and art style as Picture 1.` 开头）。但那要额外下 LoRA 和节点，且对"动作可 free 调整"的需求来说，本节点 + 合适 denoise 通常已经够用。
 

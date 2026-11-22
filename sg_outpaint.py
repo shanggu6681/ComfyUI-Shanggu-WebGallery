@@ -411,7 +411,9 @@ class ShangguImagePrepForImg2Img:
     * 本节点：整图裁切/缩放到目标尺寸，输出**不带 noise_mask** 的 latent，
       KSampler 的 denoise 决定整图重绘强度 —— 适合「人物/风格大致保持、
       动作可变、尺寸只要达标」的 img2img 重绘。
-      denoise 0.35~0.5 更像原图；0.55~0.7 改造更明显；>0.75 基本放飞。
+      MOSS-Image（shift 5 的 flow schedule）务必用低 denoise：0.18~0.30。
+      0.5 以上起始 sigma 太高、原图 latent 被噪声淹没，模型会完全按文字重画
+      （典型症状：人物图变成 prompt 里提到的场景）。SDXL/Flux 可用 0.35~0.6。
 
     MOSS-Image 要求边长是 16 的倍数，size_multiple 默认就是 16；
     SDXL / Flux / H3 用 8 即可（也兼容 16）。
@@ -450,8 +452,9 @@ class ShangguImagePrepForImg2Img:
     FUNCTION = "prep"
     CATEGORY = "image/Shanggu 扩图"
     DESCRIPTION = ("图生图(img2img)预处理：整图裁切/缩放到目标尺寸并 VAE 编码成 latent，"
-                   "不带 mask。接 KSampler 的 latent_image，denoise 控制重绘强度"
-                   "（0.35~0.5 保留多，0.6~0.7 改造多）。MOSS 用本节点时 size_multiple=16。"
+                   "不带 mask。接 KSampler 的 latent_image，denoise 控制重绘强度。"
+                   "MOSS-Image 用 denoise 0.18~0.30（高于 0.5 人物会被文字覆盖、画成别的场景）；"
+                   "SDXL/Flux 用 0.35~0.6。MOSS 的 size_multiple=16。"
                    "和「扩图→Latent」不同：那个只重绘灰边、原图不动；这个整图重绘。")
 
     def prep(self, image, vae, aspect, long_side, fit,
@@ -491,7 +494,8 @@ class ShangguImagePrepForImg2Img:
             infos.append({
                 "index": i, "source_original": orig_size,
                 "trim_cut": cut, "target": [pw, ph], "fit": geo["mode"],
-                "note": "img2img: denoise 0.35~0.5 保留多 / 0.6~0.7 改造多 / >0.75 放飞",
+                "note": ("img2img denoise: MOSS(shift5) 0.18~0.30 / SDXL,Flux 0.35~0.60; "
+                         "若成图变成文字描述的场景而非原图人物，先把 denoise 降到 0.20"),
             })
         return (
             latents[0] if len(latents) == 1 else {"samples": torch.cat([l["samples"] for l in latents], 0)},
