@@ -23,7 +23,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 
 ASPECTS = ["16:9", "3:2", "4:3", "1:1", "3:4", "9:16", "2:1", "21:9", "自定义"]
 POSITIONS = ["居中", "偏左", "偏右", "偏上", "偏下"]
@@ -322,7 +322,7 @@ class ShangguImageExpandToLatent:
 
 
 FITS = ["完整保留(内容不裁切,推荐)", "完整保留(补灰边)", "裁切填满(无留白,会裁上下)"]
-PADS = ["边缘延展(推荐)", "中性灰", "黑色", "白色"]
+PADS = ["模糊背景(推荐)", "镜像填充", "边缘延展(会拉伸)", "中性灰", "黑色", "白色"]
 
 
 def _plural_to_wh_ex(aspect: str, long_side: int, w: int, h: int, align: int = 16) -> tuple[int, int]:
@@ -386,12 +386,7 @@ def _fit_cover_canvas(src: Image.Image, tw: int, th: int, position: str,
 
 
 def _edge_extend_rgb(r: Image.Image, tw: int, th: int, cx: int, cy: int) -> Image.Image:
-    """用源图四边像素把空区延展铺满，再在 (cx,cy) 贴回原图。
-
-    9:16 → 16:9 时，整图放在中间只占约 32% 宽，左右空区若填纯灰，
-    模型会在灰/图交界处画出硬矩形；用边缘像素延展后，模型看到的是
-    从主体自然延伸出的背景色，重绘成真实场景的概率高得多。
-    """
+    """把边缘那一列/行像素直线拉满空区（会留条纹，仅作兼容保留）。"""
     a = np.asarray(r.convert("RGB"), dtype=np.uint8)
     rh, rw = a.shape[:2]
     out = np.empty((th, tw, 3), dtype=np.uint8)
@@ -409,6 +404,43 @@ def _edge_extend_rgb(r: Image.Image, tw: int, th: int, cx: int, cy: int) -> Imag
     return Image.fromarray(out)
 
 
+def _blur_bg_pad(r: Image.Image, tw: int, th: int, cx: int, cy: int) -> Image.Image:
+    """整图放大铺满画布 + 强高斯模糊做底，再把清晰原图贴回中间。
+
+    9:16 → 16:9 时左右空区约各占 34%。模糊底保留原图的色彩分布和大致明暗，
+    但没有直线条纹、没有硬边；模型在 denoise 0.35~0.5 下会把模糊区续绘成
+    真实背景，而中间清晰的人像是锚点，不会变成无关场景。
+    """
+    sw, sh = r.size
+    scale = max(tw / float(sw), th / float(sh))
+    bw, bh = max(tw, int(sw * scale) + 2), max(th, int(sh * scale) + 2)
+    bg = r.convert("RGB").resize((bw, bh), Image.LANCZOS)
+    left, top = (bw - tw) // 2, (bh - th) // 2
+    bg = bg.crop((left, top, left + tw, top + th))
+    radius = max(18, tw // 28)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=radius))
+    bg.paste(r.convert("RGB"), (cx, cy))
+    return bg
+
+
+def _mirror_pad(r: Image.Image, tw: int, th: int, cx: int, cy: int) -> Image.Image:
+    """左右用原图镜像平铺填满空区（保持纹理连续，可能出现对称重影）。"""
+    a = np.asarray(r.convert("RGB"), dtype=np.uint8)
+    rh, rw = a.shape[:2]
+    out = np.empty((th, tw, 3), dtype=np.uint8)
+    row = np.empty((rh, tw, 3), dtype=np.uint8)
+    for x in range(0, tw, rw):
+        tile = a if (x // rw) % 2 == 0 else a[:, ::-1, :]
+        w = min(rw, tw - x)
+        row[:, x:x + w, :] = tile[:, :w, :]
+    for y in range(0, th, rh):
+        tile = row if (y // rh) % 2 == 0 else row[::-1, :, :]
+        h = min(rh, th - y)
+        out[y:y + h, :, :] = tile[:h, :, :]
+    out[cy:cy + rh, cx:cx + rw, :] = a
+    return Image.fromarray(out)
+
+
 def _fit_contain_canvas(src: Image.Image, tw: int, th: int, position: str,
                         fill_rgb: tuple[int, int, int], pad: str = PADS[0]):
     """整图可见（不裁内容），短出来的边按 pad 填充。返回 (canvas RGB, geo)。"""
@@ -421,7 +453,11 @@ def _fit_contain_canvas(src: Image.Image, tw: int, th: int, position: str,
     y = th - nh
     cx = 0 if position == "偏左" else (x if position == "偏右" else x // 2)
     cy = 0 if position == "偏上" else (y if position == "偏下" else y // 2)
-    if str(pad).startswith("边缘"):
+    if str(pad).startswith("模糊"):
+        canvas = _blur_bg_pad(r, tw, th, cx, cy)
+    elif str(pad).startswith("镜像"):
+        canvas = _mirror_pad(r, tw, th, cx, cy)
+    elif str(pad).startswith("边缘"):
         canvas = _edge_extend_rgb(r, tw, th, cx, cy)
     else:
         canvas = Image.new("RGB", (tw, th), fill_rgb)
@@ -439,9 +475,9 @@ class ShangguImagePrepForImg2Img:
     * 本节点：整图裁切/缩放到目标尺寸，输出**不带 noise_mask** 的 latent，
       KSampler 的 denoise 决定整图重绘强度 —— 适合「人物/风格大致保持、
       动作可变、尺寸只要达标」的 img2img 重绘。
-      MOSS-Image（shift 5 的 flow schedule）务必用低 denoise：0.18~0.30。
-      0.5 以上起始 sigma 太高、原图 latent 被噪声淹没，模型会完全按文字重画
-      （典型症状：人物图变成 prompt 里提到的场景）。SDXL/Flux 可用 0.35~0.6。
+      MOSS-Image（shift 5 的 flow schedule）：完整保留+模糊背景时 denoise 0.35~0.45
+      （要够高才能把模糊区续绘成真实背景，但别到 0.5 以上，否则整图按文字重画、
+      人物变场景）。cover 铺满整图重绘时 0.18~0.30。SDXL/Flux 可用 0.4~0.6。
 
     MOSS-Image 要求边长是 16 的倍数，size_multiple 默认就是 16；
     SDXL / Flux / H3 用 8 即可（也兼容 16）。
@@ -460,8 +496,9 @@ class ShangguImagePrepForImg2Img:
                                "tooltip": "完整保留=整图可见、一个像素都不裁（9:16→16:9 必选，"
                                           "否则人物会被切掉大半）；裁切填满=铺满无空边但会裁掉上下"}),
                 "pad": (PADS, {"default": PADS[0],
-                               "tooltip": "仅 fit=完整保留 时生效。边缘延展=用原图边缘色填满空区，"
-                                          "模型更容易续绘；纯色=填灰/黑/白，可能留下硬边矩形"}),
+                               "tooltip": "仅 fit=完整保留 时生效。模糊背景=整图放大高斯模糊后铺满、"
+                                          "再贴回清晰原图（推荐，模型会把模糊区续绘成真实场景）；"
+                                          "镜像填充=左右镜像原图；边缘延展=边缘色直线拉伸（会留条纹）"}),
             },
             "optional": {
                 "position": (POSITIONS, {"default": "居中",
@@ -484,10 +521,11 @@ class ShangguImagePrepForImg2Img:
     CATEGORY = "image/Shanggu 扩图"
     DESCRIPTION = ("图生图(img2img)预处理：整图裁切/缩放到目标尺寸并 VAE 编码成 latent，"
                    "不带 mask。接 KSampler 的 latent_image，denoise 控制重绘强度。"
-                   "默认「完整保留」＋边缘延展：9:16 竖图转 16:9 时整图可见、一个像素不裁，"
-                   "左右空区用原图边缘色填满，避免裁掉人物或留下灰边。"
-                   "MOSS-Image 用 denoise 0.18~0.30（高于 0.5 人物会被文字覆盖、画成别的场景）；"
-                   "SDXL/Flux 用 0.35~0.6。MOSS 的 size_multiple=16。"
+                   "默认「完整保留」＋模糊背景：9:16 竖图转 16:9 时整图可见、一个像素不裁，"
+                   "左右空区用整图放大高斯模糊铺底再贴回清晰原图，没有拉伸条纹和硬边。"
+                   "MOSS-Image 此模式 denoise 0.35~0.45（低于 0.35 模糊区续绘不出来、"
+                   "高于 0.5 人物会被文字覆盖画成别的场景）；SDXL/Flux 用 0.4~0.6。"
+                   "MOSS 的 size_multiple=16。"
                    "和「扩图→Latent」不同：那个只重绘灰边、原图不动；这个整图重绘。")
 
     def prep(self, image, vae, aspect, long_side, fit,
@@ -529,8 +567,8 @@ class ShangguImagePrepForImg2Img:
                 "index": i, "source_original": orig_size,
                 "trim_cut": cut, "target": [pw, ph], "fit": geo["mode"],
                 "pad": geo.get("pad", ""), "content_visible_px": geo["resized"] if not cover else [pw, ph],
-                "note": ("img2img denoise: MOSS(shift5) 0.18~0.30 / SDXL,Flux 0.35~0.60; "
-                         "若成图变成文字描述的场景而非原图人物，先把 denoise 降到 0.20"),
+                "note": ("img2img denoise: MOSS 完整保留+模糊背景 0.35~0.45 / cover 0.18~0.30; "
+                         "变场景=denoise 太高，模糊区续绘不出=太低；边缘延展会产生拉伸条纹"),
             })
         return (
             latents[0] if len(latents) == 1 else {"samples": torch.cat([l["samples"] for l in latents], 0)},
