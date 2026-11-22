@@ -52,7 +52,7 @@ def _clean_settings(raw: Any) -> dict:
     keys = ("cookie", "ua", "referer", "proxy", "url_regex", "page_template", "safe_only", "per_page")
     out = {k: raw.get(k, "") for k in keys}
     out["safe_only"] = raw.get("safe_only", True) is not False
-    # 18+ 开关：默认开启（aitag.win 这类站点的主要内容就在 show_r18=1 里）
+    # 18+ 固定开启（前端已无开关）：aitag.win 的主要内容就在 show_r18=1 里
     rv = raw.get("r18", True)
     out["r18"] = rv is not False and str(rv).lower() not in ("false", "0", "no", "off", "")
     # 榜单/排序方式：civitai 用 sort+period，aitag.win 用 /api/rank/... 路径。
@@ -181,6 +181,10 @@ async def handle_fetch(request: web.Request) -> web.Response:
     reset = bool(d.get("reset", True))
     url = str(d.get("url") or "").strip()
     settings = _clean_settings(d.get("settings"))
+    # aitag.win 固定 18+：前端已移除 18+ 开关，只要网址是它，就强制 show_r18=1。
+    # 这样老工作流里残留的 r18=false 也不会把成人内容过滤掉。
+    if "aitag.win" in url.lower():
+        settings["r18"] = True
     s = get_session(sid, reset)
     s["settings"] = settings
 
