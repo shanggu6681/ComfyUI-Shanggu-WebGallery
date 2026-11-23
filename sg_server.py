@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import time
 import urllib.parse
 from typing import Any
@@ -483,6 +484,159 @@ async def handle_select(request: web.Request) -> web.Response:
     })
 
 
+async def handle_import(request: web.Request) -> web.Response:
+    """本机导入图片/文件夹（multipart 上传）：存进 input 目录，返回文件名列表。
+
+    前端每张图发一个请求（form 字段名 files）；非图片扩展名的文件直接跳过，
+    所以选文件夹时混进来的 desktop.ini / 缩略图缓存等不会被误存。
+    """
+    if not (request.content_type or "").startswith("multipart/"):
+        return _error("需要 multipart/form-data 上传")
+    try:
+        reader = await request.multipart()
+    except Exception as e:
+        return _error(f"解析上传失败: {e}")
+    try:
+        import folder_paths
+        input_dir = folder_paths.get_input_directory()
+    except Exception:
+        input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input")
+    os.makedirs(input_dir, exist_ok=True)
+
+    saved: list[dict] = []
+    stamp = int(time.time() * 1000)
+    idx = 0
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if getattr(part, "name", "") != "files":
+            continue
+        orig = os.path.basename(getattr(part, "filename", "") or "")
+        stem, ext = os.path.splitext(orig)
+        ext = ext.lower()
+        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"):
+            continue
+        chunks = []
+        while True:
+            chunk = await part.read_chunk(1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            continue
+        idx += 1
+        safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", stem)[:60] or "img"
+        filename = f"sg_import_{stamp}_{idx}_{safe}{ext or '.jpg'}"
+        dest = os.path.join(input_dir, filename)
+        with open(dest, "wb") as f:
+            f.write(data)
+        try:
+            from PIL import Image
+            with Image.open(dest) as im:
+                width, height = im.size
+        except Exception:
+            width = height = 0
+        saved.append({"filename": filename, "width": width, "height": height, "name": orig})
+    if not saved:
+        return _error("没有可导入的图片（支持 jpg / jpeg / png / webp / bmp / gif）")
+    return web.json_response({"ok": True, "items": saved})
+
+
+async def handle_list_loras(request: web.Request) -> web.Response:
+    """列出本机所有 LoRA 文件（相对 loras 目录的路径，含子目录）。"""
+    try:
+        import folder_paths
+        names = folder_paths.get_filename_list("loras") or []
+    except Exception as e:
+        return _error(f"读取 loras 目录失败: {e}")
+    return web.json_response({"ok": True, "items": sorted(names)})
+
+
+# 模型文件索引缓存：walk models 目录较慢，60 秒内复用
+_MODEL_INDEX: dict = {"t": 0.0, "files": []}
+
+
+def _model_index() -> list[str]:
+    """返回所有模型文件的相对路径列表（如 diffusion_models/krea2_xxx.safetensors）。"""
+    import folder_paths
+    now = time.time()
+    if _MODEL_INDEX["files"] and now - _MODEL_INDEX["t"] < 60:
+        return _MODEL_INDEX["files"]
+    files: list[str] = []
+    seen_roots: dict[str, str] = {}
+    # 新版 ComfyUI 没有 "models" 这个注册键（只有 diffusion_models/loras/vae 等子键），
+    # 直接遍历全部注册键收集其目录，避免 KeyError
+    registry = getattr(folder_paths, "folder_names_and_paths", {})
+    for key, (paths, _exts) in registry.items():
+        for p in paths or []:
+            ap = os.path.abspath(p)
+            if ap not in seen_roots:
+                seen_roots[ap] = key
+    for ap, key in seen_roots.items():
+        if not os.path.isdir(ap):
+            continue
+        for dirpath, dirnames, filenames in os.walk(ap):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, fn), ap).replace("\\", "/")
+                files.append(f"{key}/{rel}")
+    _MODEL_INDEX["t"] = now
+    _MODEL_INDEX["files"] = files
+    return files
+
+
+async def handle_check_models(request: web.Request) -> web.Response:
+    """检查给定的模型文件名在本机 models 目录里是否存在。
+
+    请求体 {"names": ["krea2_turbo_fp8_scaled.safetensors", ...]}；
+    按「相对路径精确匹配 -> 文件名（任意子目录）不区分大小写」匹配。
+    返回 {"ok": true, "found": {名: 相对路径}, "missing": [名, ...]}
+    """
+    try:
+        d = await request.json()
+    except Exception:
+        return _error("请求体不是合法 JSON")
+    names = d.get("names")
+    if not isinstance(names, list):
+        return _error("names 必须是数组")
+    try:
+        index = _model_index()
+    except Exception as e:
+        return _error(f"扫描 models 目录失败: {e}")
+
+    by_path = {f.lower(): f for f in index}
+    by_name: dict[str, list[str]] = {}
+    for f in index:
+        by_name.setdefault(os.path.basename(f).lower(), []).append(f)
+
+    found: dict[str, str] = {}
+    missing: list[str] = []
+    for raw in names:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        norm = name.replace("\\", "/").lower()
+        hit = by_path.get(norm)
+        if hit is None:
+            cands = by_name.get(os.path.basename(norm), [])
+            # 子目录名也可能出现在用户写法里，先试全路径后缀匹配
+            for f in index:
+                if f.lower().endswith("/" + norm) or f.lower().endswith("\\" + norm):
+                    hit = f
+                    break
+            if hit is None and cands:
+                hit = cands[0]
+        if hit:
+            found[name] = hit
+        else:
+            missing.append(name)
+    return web.json_response({"ok": True, "found": found, "missing": missing})
+
+
 async def handle_health(request: web.Request) -> web.Response:
     try:
         import folder_paths
@@ -493,7 +647,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "ok": True, "name": "ComfyUI-Shanggu-WebGallery", "version": "1.0.0",
         "sessions": len(SESSIONS), "input_dir": input_dir,
         "endpoints": ["/sg_gallery/fetch", "/sg_gallery/parse", "/sg_gallery/expand",
-                      "/sg_gallery/thumb", "/sg_gallery/select"],
+                      "/sg_gallery/thumb", "/sg_gallery/select", "/sg_gallery/import",
+                      "/sg_gallery/list_loras", "/sg_gallery/check_models"],
     })
 
 
@@ -519,6 +674,9 @@ def install_routes() -> None:
     routes.post("/sg_gallery/expand")(handle_expand)
     routes.get("/sg_gallery/thumb")(handle_thumb)
     routes.post("/sg_gallery/select")(handle_select)
+    routes.post("/sg_gallery/import")(handle_import)
+    routes.get("/sg_gallery/list_loras")(handle_list_loras)
+    routes.post("/sg_gallery/check_models")(handle_check_models)
     print("[ShangguWebGallery] HTTP 接口已注册: /sg_gallery/*")
 
 

@@ -292,6 +292,8 @@ class ShangguRelayVSRUpscale:
 
     @staticmethod
     def _sample(m, image, seed, chunk_tokens=DEFAULT_CHUNK_TOKENS):
+        from comfy_extras.nodes_wan import RelayVSRConditioning
+
         old = (_vsr.RELAY_WAN_CACHE_KEYFRAMES, _vsr.RELAY_WAN_CHUNK_TOKENS)
         try:
             _vsr.RELAY_WAN_CACHE_KEYFRAMES = 0

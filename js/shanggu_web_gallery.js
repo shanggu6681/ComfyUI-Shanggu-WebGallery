@@ -26,23 +26,24 @@ const SAVE_TILES = 3000;   // 写进 workflow 的条目上限，避免 JSON 过�
 const PANELS = new Map();
 
 /* ------------------------------------------------------------------ 样式 */
+/* 卡片风格与保存图像卡片（sg_save_image）统一：深色底 + 青绿描边 + 品牌色强调 */
 const CSS = `
 .sg-root{box-sizing:border-box;display:flex;flex-direction:column;gap:6px;width:100%;height:100%;
-  padding:8px;font:12px/1.45 system-ui,"Microsoft YaHei",sans-serif;color:var(--fg-color,#e6e6e6);}
+  padding:8px 9px;font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#c9d6d6;
+  background:rgba(0,0,0,.28);border:1px solid rgba(14,165,164,.22);border-radius:8px;}
 .sg-root *{box-sizing:border-box}
 .sg-root button,.sg-root input,.sg-root textarea,.sg-root select{
-  font:inherit;color:var(--fg-color,#e6e6e6);background:var(--comfy-input-bg,#2b2b2b);
-  border:1px solid var(--border-color,#4a4a4a);border-radius:4px;padding:4px 6px;outline:none}
-.sg-root button{cursor:pointer;background:var(--comfy-menu-bg,#353535);white-space:nowrap}
-.sg-root button:hover{border-color:#4c9ffe;color:#fff}
-.sg-root button.sg-primary{background:#1d6fc4;border-color:#1d6fc4;color:#fff;font-weight:600}
+  font:inherit;color:#dfe9e8;background:#111617;border:1px solid #333d40;border-radius:6px;}
+.sg-root button{cursor:pointer;background:#1a2123;border-color:#3a4448;color:#c9d6d6;white-space:nowrap}
+.sg-root button:hover{border-color:#0ea5a4;color:#fff}
+.sg-root button.sg-primary{background:#0ea5a4;border-color:#0ea5a4;color:#04201d;font-weight:600}
 .sg-root button.sg-go{background:#18804a;border-color:#18804a;color:#fff;font-weight:600}
-.sg-root button.sg-on{border-color:#4c9ffe;color:#8ec5ff;background:#203a55}
+.sg-root button.sg-on{border-color:#0ea5a4;color:#7ce0dc;background:rgba(14,165,164,.14)}
 .sg-root button:disabled{opacity:.45;cursor:default}
-.sg-root input:focus,.sg-root textarea:focus{border-color:#4c9ffe}
+.sg-root input:focus,.sg-root textarea:focus{border-color:#0ea5a4}
 .sg-tabs{display:flex;gap:4px;flex:none}
 .sg-tabs button{flex:1;padding:4px 2px;font-size:11px;opacity:.75}
-.sg-tabs button.sg-on{opacity:1;border-color:#4c9ffe;color:#8ec5ff}
+.sg-tabs button.sg-on{opacity:1;border-color:#0ea5a4;color:#7ce0dc}
 .sg-pane{display:flex;flex-direction:column;gap:5px;flex:none}
 .sg-pane[hidden]{display:none}
 .sg-row{display:flex;gap:5px;align-items:center}
@@ -79,7 +80,7 @@ const CSS = `
 .sg-group-count{position:absolute;left:2px;top:2px;max-width:calc(100% - 4px);
   background:rgba(0,0,0,.72);color:#ffd479;font-size:9px;font-weight:700;
   padding:0 4px;border-radius:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sg-tile.sg-expanded .sg-group-count{background:#1d6fc4;color:#fff}
+.sg-tile.sg-expanded .sg-group-count{background:#0ea5a4;color:#04201d}
 .sg-tile.sg-child{box-shadow:inset 3px 0 0 #e0a44a}
 .sg-collapse{position:absolute;right:2px;bottom:2px;z-index:2;cursor:pointer;
   background:rgba(0,0,0,.78);color:#fff;font-size:9px;padding:1px 4px;border-radius:3px}
@@ -92,8 +93,8 @@ const CSS = `
 .sg-adv-grid label{opacity:.8;white-space:nowrap}
 .sg-adv-grid input,.sg-adv-grid select{width:100%;font-size:10.5px;padding:2px 4px}
 .sg-hint{font-size:10px;opacity:.75;line-height:1.5}
-.sg-hint code{color:#8ec5ff}
-.sg-bookmark{display:inline-block;margin-top:2px;color:#8ec5ff;text-decoration:underline;cursor:grab}
+.sg-hint code{color:#7ce0dc}
+.sg-bookmark{display:inline-block;margin-top:2px;color:#7ce0dc;text-decoration:underline;cursor:grab}
 /* 「加载内容」榜单选择 */
 .sg-rank{display:flex;gap:5px;align-items:center;font-size:10.5px;flex:none}
 .sg-rank label{opacity:.75;white-space:nowrap}
@@ -306,7 +307,7 @@ function buildPanel(node) {
   });
 
   const tabs = el("div", "sg-tabs");
-  const tabDefs = [["url", "网址抓取"], ["paste", "粘贴源码"], ["bridge", "浏览器桥接"]];
+  const tabDefs = [["url", "网址抓取"], ["import", "导入图片"], ["folder", "导入文件夹"]];
   const tabBtns = {};
   const panes = {};
   tabDefs.forEach(([key, label]) => {
@@ -314,6 +315,10 @@ function buildPanel(node) {
     b.onclick = () => {
       Object.entries(tabBtns).forEach(([k, v]) => v.classList.toggle("sg-on", k === key));
       Object.entries(panes).forEach(([k, v]) => (v.hidden = k !== key));
+      // 「导入图片 / 导入文件夹」：点页签本身就直接弹文件/文件夹选择框，
+      // 不再叠加额外的按钮；fileInput/dirInput 在下方定义，点击时已初始化
+      if (key === "import") setTimeout(() => fileInput.click(), 0);
+      if (key === "folder") setTimeout(() => dirInput.click(), 0);
     };
     tabBtns[key] = b;
     tabs.appendChild(b);
@@ -395,39 +400,109 @@ function buildPanel(node) {
 
   panes.url = paneUrl;
 
-  /* --- 粘贴源码 --- */
-  const panePaste = el("div", "sg-pane");
-  const pasteArea = el("textarea");
-  pasteArea.placeholder = "粘贴 HTML 源码 / JSON 接口返回 / 每行一个图片网址";
-  const pasteRow = el("div", "sg-row");
-  const appendLabel = el("label", "", "追加到现有列表");
-  const appendChk = el("input");
-  appendChk.type = "checkbox";
-  appendLabel.prepend(appendChk);
-  const btnParse = el("button", "sg-primary", "解析并加入图库");
-  pasteRow.append(appendLabel, btnParse);
-  panePaste.append(pasteArea, pasteRow);
-  panePaste.hidden = true;
-  panes.paste = panePaste;
+  /* --- 导入图片：点页签即弹选择框，选完直接进下方图库网格并默认选中 --- */
+  const paneImport = el("div", "sg-pane");
+  const fileInput = el("input");
+  fileInput.type = "file";
+  fileInput.accept = "image/jpeg,image/png,image/webp,image/bmp,image/gif";
+  fileInput.multiple = true;
+  fileInput.hidden = true;
+  paneImport.append(fileInput);
+  paneImport.appendChild(el("div", "sg-hint",
+    "点「导入图片」选择文件（可多选）；图片会出现在下方图库并处于选中状态，点「▶ 运行」即可。"));
+  paneImport.hidden = true;
+  panes.import = paneImport;
 
-  /* --- 浏览器桥接 --- */
-  const paneBridge = el("div", "sg-pane");
-  const hint = el("div", "sg-hint");
-  hint.innerHTML =
-    "有些站点有 Cloudflare / 必须登录，ComfyUI 后台直接抓不到。" +
-    "把下面的链接拖到书签栏，在该网站页面上点一下，它会复制当前页所有图片网址；" +
-    "再回到「粘贴源码」Ctrl+V 即可（可先滚动网页加载更多，重复抓取时勾选「追加」）。";
-  const bmLink = el("a", "sg-bookmark", "📌 拖我到书签栏：复制本页图片网址");
-  bmLink.href = BOOKMARKLET;
-  bmLink.onclick = (e) => e.preventDefault();
-  const btnCopyBM = el("button", "", "复制书签代码");
-  const bmRow = el("div", "sg-row");
-  bmRow.append(btnCopyBM);
-  paneBridge.append(hint, bmLink, bmRow);
-  paneBridge.hidden = true;
-  panes.bridge = paneBridge;
+  /* --- 导入文件夹：点页签即弹文件夹选择框，整包进图库、默认全选 --- */
+  const paneFolder = el("div", "sg-pane");
+  const dirInput = el("input");
+  dirInput.type = "file";
+  dirInput.setAttribute("webkitdirectory", "");
+  dirInput.hidden = true;
+  paneFolder.append(dirInput);
+  paneFolder.appendChild(el("div", "sg-hint",
+    "点「导入文件夹」选择文件夹；里面所有图片会出现在下方图库并全部选中，点「▶ 运行」逐张循环。"));
+  paneFolder.hidden = true;
+  panes.folder = paneFolder;
 
-  root.append(paneUrl, panePaste, paneBridge);
+  root.append(paneUrl, paneImport, paneFolder);
+
+  /* --- 导入的上传与选图逻辑 --- */
+  async function uploadFiles(fileList) {
+    const files = Array.from(fileList || []).filter((f) =>
+      /\.(jpe?g|png|webp|bmp|gif)$/i.test(f.name));
+    if (!files.length) { setStatus("没有可导入的图片（支持 jpg / png / webp / bmp / gif）", true); return []; }
+    const out = [];
+    for (let i = 0; i < files.length; i++) {
+      setStatus(`正在导入 ${i + 1}/${files.length}: ${files[i].name}`);
+      const fd = new FormData();
+      fd.append("files", files[i], files[i].name);
+      try {
+        const resp = await api.fetchApi(EP("import"), { method: "POST", body: fd });
+        if (!resp.ok) {
+          setStatus(`导入失败 (HTTP ${resp.status})` +
+            (resp.status === 404 ? "：后端导入接口不存在，请重启 ComfyUI 后再试" : ""), true);
+          continue;
+        }
+        const j = await resp.json();
+        if (j.ok && j.items && j.items.length) {
+          out.push(...j.items.map((x) => ({
+            filename: x.filename, url: "file:" + x.filename, local: true,
+            prompt: "", id: "", name: x.name || x.filename,
+            title: x.name || x.filename, width: x.width || 0, height: x.height || 0,
+          })));
+        } else if (j.error) {
+          setStatus("导入失败: " + j.error, true);
+        }
+      } catch (e) {
+        setStatus("导入失败: " + e, true);
+      }
+    }
+    return out;
+  }
+
+  function adoptImported(entries) {
+    if (!entries.length) return 0;
+    // 先进下方图库网格（和网页抓到的图同一个区域，插到最前），local 项走 /view 缩略图
+    appendItems(entries.map((e) => ({ ...e })), { ignoreLimit: true, prepend: true });
+    syncRowHeight();
+    if (entries.length > 1 && selectMode() === SEL_SINGLE) setSelectMode(SEL_MULTI);
+    if (selectMode() === SEL_SINGLE) {
+      const e = entries[entries.length - 1];   // 单图语义：最后一张替换当前选图
+      state.selected = [e];
+      state.selectedByUrl = new Map([[e.url, e]]);
+    } else {
+      for (const e of entries) {               // 多图/文件夹：默认全部选中
+        if (!state.selectedByUrl.has(e.url)) {
+          state.selected.push(e);
+          state.selectedByUrl.set(e.url, e);
+        }
+      }
+    }
+    syncWidget();
+    refreshBadges();
+    return state.selected.length;
+  }
+
+  fileInput.onchange = async () => {
+    const entries = await uploadFiles(fileInput.files);
+    if (entries.length) {
+      const n = adoptImported(entries);
+      setStatus(`已导入 ${entries.length} 张图片（下方图库已全部选中）` +
+        (n > 1 ? `，点「▶ 运行」逐张循环 ${n} 次` : "，点「▶ 运行」开始"), false);
+    }
+    // 回到「网址抓取」页签，网格是共享的，导入结果不会被切走
+    fileInput.value = "";
+  };
+  dirInput.onchange = async () => {
+    const entries = await uploadFiles(dirInput.files);
+    if (entries.length) {
+      const n = adoptImported(entries);
+      setStatus(`已导入文件夹里 ${entries.length} 张图片（下方图库已全部选中）` +
+        (n > 1 ? `，点「▶ 运行」逐张循环 ${n} 次` : "，点「▶ 运行」开始"), false);
+    }
+    dirInput.value = "";
+  };
 
   /* --- 唯一的开关：单图 / 多图，同时决定运行次数 --- */
   const modeBar = el("div", "sg-modes");
@@ -756,9 +831,15 @@ function buildPanel(node) {
       (gid && total > 1 ? "\n▸ 点击展开这个作品的其余 " + (total - 1) + " 张图" : "");
     const img = el("img");
     img.loading = "lazy";
-    const ref = it.referer ? "&referer=" + encodeURIComponent(it.referer) : "";
-    img.src = FULL("thumb?session_id=" + encodeURIComponent(state.sid) +
-                   "&w=320&url=" + encodeURIComponent(it.thumb || it.url)) + ref;
+    if (it.local) {
+      // 本机导入的图片：已在 input 目录，直接用 ComfyUI 原生 /view 出缩略图
+      img.src = "/view?filename=" + encodeURIComponent(it.filename || "") +
+        "&type=input&subfolder=";
+    } else {
+      const ref = it.referer ? "&referer=" + encodeURIComponent(it.referer) : "";
+      img.src = FULL("thumb?session_id=" + encodeURIComponent(state.sid) +
+                     "&w=320&url=" + encodeURIComponent(it.thumb || it.url)) + ref;
+    }
     img.onerror = () => {
       img.remove();
       tile.classList.add("sg-broken");
@@ -793,8 +874,14 @@ function buildPanel(node) {
       if (!opts.fromRestore && state.seenUrls.has(it.url)) continue;
       if (state.items.length >= cap) { state.truncated = true; break; }
       state.seenUrls.add(it.url);
-      state.items.push(it);
-      grid.appendChild(makeTile(it));
+      if (opts.prepend) {
+        // 导入的图片永远插到最前面，刷新即可见，不用往下翻
+        state.items.unshift(it);
+        grid.insertBefore(makeTile(it), grid.firstChild);
+      } else {
+        state.items.push(it);
+        grid.appendChild(makeTile(it));
+      }
     }
     syncRowHeight();
     refreshBadges();
@@ -878,6 +965,21 @@ function buildPanel(node) {
       const entry = state.selectedByUrl.get(it.url);
       state.selectedByUrl.delete(it.url);
       state.selected = state.selected.filter((x) => x !== entry);
+      syncWidget();
+      refreshBadges();
+      return;
+    }
+    // 本机导入的图片已在 input 目录，不需要走 /select 下载，直接登记选区
+    if (it.local) {
+      const entry = { filename: it.filename, url: it.url,
+                      prompt: it.prompt || "", id: it.id || "" };
+      if (selectMode() === SEL_SINGLE) {
+        state.selected = [entry];
+        state.selectedByUrl = new Map([[it.url, entry]]);
+      } else {
+        state.selected.push(entry);
+        state.selectedByUrl.set(it.url, entry);
+      }
       syncWidget();
       refreshBadges();
       return;
@@ -979,32 +1081,6 @@ function buildPanel(node) {
     }
   }
 
-  async function doParse() {
-    const raw = pasteArea.value;
-    if (!raw.trim()) { setStatus("请先粘贴内容", true); return; }
-    setStatus("正在解析…");
-    try {
-      const r = await postJSON(EP("parse"), {
-        session_id: state.sid,
-        raw: raw,
-        base_url: urlInput.value.trim(),
-        reset: !appendChk.checked,
-        settings: collectSettings(),
-      });
-      if (!r.ok) { setStatus(r.error || "解析失败", true); return; }
-      if (!appendChk.checked) {
-        grid.innerHTML = ""; state.items = []; state.childItems = [];
-        state.seenUrls.clear(); state.truncated = false;
-      }
-      appendItems(r.items || []);
-      state.hasMore = false;
-      if (r.message && !(r.items || []).length) setStatus(r.message, false);
-      else updateStatus();
-    } catch (e) {
-      setStatus("解析失败: " + e, true);
-    }
-  }
-
   grid.addEventListener("scroll", () => {
     state.autoChained = 0;         // 用户真的滚动了，续拉计数重新开始
     if (nearGridBottom()) doFetch(false);
@@ -1019,13 +1095,6 @@ function buildPanel(node) {
   urlInput.onchange = () => { rememberUrl(urlInput.value.trim()); detectSiteKind(); };
   // 手动点「加载更多」永远无视 1500 格软上限，哪怕状态栏已经提示到顶
   btnMore.onclick = () => doFetch(false, { ignoreLimit: true });
-  btnParse.onclick = doParse;
-  btnCopyBM.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(BOOKMARKLET);
-      setStatus("书签代码已复制，新建一个书签并把代码粘到网址栏即可");
-    } catch (e) { setStatus("复制失败，请手动展开高级设置查看", true); }
-  };
 
   /* --- 模式开关 --- */
   function setSelectMode(v) {
@@ -1046,11 +1115,17 @@ function buildPanel(node) {
 
   /* --- 运行按钮：与 ComfyUI 的 Run 走同一条链路，多图时自动扇出 --- */
   btnRun.onclick = async () => {
-    if (!state.selected.length) { setStatus("请先点选至少一张图片", true); return; }
+    if (!state.selected.length) {
+      setStatus("没有已选图片：请在下方图库点选，或用「导入图片 / 导入文件夹」导入", true);
+      return;
+    }
     if (state.runTotal > 0) { setStatus("本轮执行尚未结束，请稍候", true); return; }
+    console.log("[ShangguWebGallery] 运行:", selectMode(),
+      state.selected.map((x) => x.filename || x.url));
     try {
       await app.queuePrompt(0, 1, {});
     } catch (e) {
+      console.error("[ShangguWebGallery] 运行失败:", e);
       setStatus("执行失败: " + e, true);
     }
   };
@@ -1256,12 +1331,38 @@ function installWidthGuard(node, dw, root) {
   }, 150);
 }
 
+/** 前端 queuePrompt 会读 graphToPrompt() 结果的 .output；cg-use-everywhere 的
+ *  call_function_with_modified_graph 把真实序列化异常吞掉后返回 undefined，
+ *  于是用户看到的是误导性的 "Cannot read properties of undefined (reading 'output')"。
+ *  这里在扩展 setup 之后（setTimeout，保证包在其他插件最外层）再包一道，
+ *  把空结果翻译成明确的提示。 */
+function guardGraphToPrompt() {
+  if (typeof app.graphToPrompt !== "function" || app.__sgGtpGuard) return;
+  app.__sgGtpGuard = true;
+  const gtp = app.graphToPrompt.bind(app);
+  app.graphToPrompt = async function (...args) {
+    const r = await gtp(...args);
+    if (r == null) {
+      console.error("[ShangguWebGallery] graphToPrompt 返回了空值：真实的序列化异常" +
+        "已被 cg-use-everywhere 插件吞掉。请按 F12 打开控制台，把红色的错误日志" +
+        "（Logger 输出）发出来即可定位。");
+      throw new Error(
+        "工作流序列化失败：真实报错被 cg-use-everywhere 插件吞掉了。" +
+        "请按 F12 打开浏览器控制台，把红色的错误日志（Logger 输出）发出来即可定位。"
+      );
+    }
+    return r;
+  };
+}
+
 /* ------------------------------------------------------------------ 注册 */
 app.registerExtension({
   name: "Shanggu.WebImageGallery",
   async setup() {
     injectCSS();
     installRunLoop();
+    // 延后到所有扩展 setup 完成，确保我们包在其他插件（尤其 cg-use-everywhere）最外层
+    setTimeout(guardGraphToPrompt, 0);
   },
   async nodeCreated(node) {
     const cls = node.comfyClass || (node.constructor && node.constructor.comfyClass) || node.type;

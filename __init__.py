@@ -19,10 +19,22 @@ NODE_DISPLAY_NAME_MAPPINGS.update(sg_qwen_outpaint.NODE_DISPLAY_NAME_MAPPINGS)  
 import sg_relay_vsr  # noqa: E402
 NODE_CLASS_MAPPINGS.update(sg_relay_vsr.NODE_CLASS_MAPPINGS)  # noqa: E402
 NODE_DISPLAY_NAME_MAPPINGS.update(sg_relay_vsr.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
+import sg_group_switch  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_group_switch.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_group_switch.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
+import sg_save_image  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_save_image.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_save_image.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
+import sg_lora_loader  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_lora_loader.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_lora_loader.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
+import sg_note_card  # noqa: E402
+NODE_CLASS_MAPPINGS.update(sg_note_card.NODE_CLASS_MAPPINGS)  # noqa: E402
+NODE_DISPLAY_NAME_MAPPINGS.update(sg_note_card.NODE_DISPLAY_NAME_MAPPINGS)  # noqa: E402
 import sg_server  # noqa: E402,F401  (导入即注册 /sg_gallery/* 路由)
 
 WEB_DIRECTORY = "./js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
-print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / Qwen扩图草图 / RelayVSR超分")
+print("[ShangguWebGallery] 节点已加载: 网页图库选图器 / Qwen扩图草图 / RelayVSR超分 / 组开关 / 保存图像 / LoRA加载器 / 说明卡片")

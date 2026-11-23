@@ -209,19 +209,76 @@ def _align32(n: int) -> int:
     return max(32, int(round(n / 32.0)) * 32)
 
 
+# 没有数字时按关键词猜比例（按顺序匹配，先specific后general）
+_RATIO_WORDS = (
+    ("ultrawide", 21.0 / 9.0), ("ultra-wide", 21.0 / 9.0), ("ultrawide", 21.0 / 9.0),
+    ("cinemascope", 2.39), ("anamorphic", 2.39), ("cinema", 2.39),
+    ("widescreen", 16.0 / 9.0), ("landscape", 16.0 / 9.0), ("horizontal", 16.0 / 9.0),
+    ("横", 16.0 / 9.0),
+    ("portrait", 3.0 / 4.0), ("vertical", 9.0 / 16.0), ("tall", 9.0 / 16.0),
+    ("竖", 9.0 / 16.0),
+    ("square", 1.0), ("方", 1.0),
+    ("photo", 3.0 / 2.0),
+    ("standard", 4.0 / 3.0),
+)
+
+
+def _parse_ratio(aspect) -> float | None:
+    """从任意形态的比例输入里提取宽高比（宽/高），解析不到返回 None。
+
+    支持的写法：
+    - "16:9"、"9:16 (Portrait Widescreen)"、"1:1 (Square)"（带任意括号注释）
+    - 小数比例 "2.35:1"、"1.78:1"，全角冒号 "16：9"
+    - 其他分隔符 "16/9"、"16x9"、"16*9"、"16×9"
+    - 纯数字 "1.78"（直接当宽/高比）
+    - 纯文字 "square"、"portrait"、"widescreen"、"横图"、"竖图" 等关键词
+    - 数字/数组 [16, 9]、(9, 16)
+    """
+    if aspect is None:
+        return None
+    if isinstance(aspect, bool):
+        return None
+    if isinstance(aspect, (int, float)):
+        return float(aspect) if aspect > 0 else None
+    if isinstance(aspect, (list, tuple)) and len(aspect) == 2:
+        try:
+            w, h = float(aspect[0]), float(aspect[1])
+        except (TypeError, ValueError):
+            return None
+        return w / h if w > 0 and h > 0 else None
+    s = str(aspect).strip()
+    if not s:
+        return None
+    # 1) "数字 分隔符 数字"（优先取字符串里第一个出现的比例，注释里的数字不算）
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[:：/xX×*]\s*(\d+(?:\.\d+)?)", s)
+    if m:
+        w, h = float(m.group(1)), float(m.group(2))
+        if w > 0 and h > 0:
+            return w / h
+    # 2) 纯数字：直接当宽/高比（"1.78" ≈ 16:9）
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)", s)
+    if m:
+        v = float(m.group(1))
+        return v if v > 0 else None
+    # 3) 关键词兜底（square/portrait/widescreen/横图/竖图……）
+    low = s.lower()
+    for kw, r in _RATIO_WORDS:
+        if kw in low or kw in s:
+            return r
+    return None
+
+
 def _target_wh(aspect: str, long_side: int, custom_w: int = 0,
                custom_h: int = 0) -> tuple[int, int]:
     """目标画布尺寸，长边=long_side，两边对齐 32（Qwen latent 要求）。
 
-    aspect 兼容带后缀的旧工作流值，如 ausboss 原版节点的
-    "9:16 (Portrait Widescreen)"——用正则提取 "数字:数字"，解析不到才兜底 16:9。
+    aspect 接受任意形态的比例输入（见 _parse_ratio），例如 ausboss 原版节点的
+    "9:16 (Portrait Widescreen)" 这类带括号注释的值也能准确读取；实在解析不到才兜底 16:9。
     """
-    if aspect == "自定义" and custom_w > 0 and custom_h > 0:
+    if str(aspect) == "自定义" and custom_w > 0 and custom_h > 0:
         return _align32(custom_w), _align32(custom_h)
-    m = re.search(r"(\d+)\s*:\s*(\d+)", str(aspect))
-    if m:
-        ratio = float(m.group(1)) / float(m.group(2))
-    else:
+    ratio = _parse_ratio(aspect)
+    if ratio is None:
         ratio = 16.0 / 9.0
     if ratio >= 1:
         w = _align32(long_side)
@@ -268,7 +325,9 @@ class ShangguQwenOutpaintDraft:
             "required": {
                 "image": ("IMAGE", {"tooltip": "源图，例如 9:16 竖图；整图保留、不裁不变形"}),
                 "aspect": (ASPECTS, {"default": "16:9",
-                                     "tooltip": "目标比例，例如 16:9"}),
+                                     "tooltip": "目标比例，例如 16:9。接别的节点进来也行："
+                                                "带括号注释（9:16 (Portrait)）、小数（2.35:1）、"
+                                                "纯数字（1.78）、16x9/16/9、甚至纯文字（square/portrait/竖图）都能准确识别"}),
                 "draft_long_side": ("INT", {"default": 768, "min": 256,
                                             "max": 2048, "step": 32,
                                             "tooltip": "草图长边像素。只是草图，768 够用且快"}),
@@ -322,13 +381,18 @@ class ShangguQwenOutpaintDraft:
                 model, turbo_lora, 1.0)[0]
         return model, clip, vae
 
-    def generate(self, image, aspect, draft_long_side, prompt, negative,
-                 seed, quality, trim, auto_prefix, custom_width=0,
-                 custom_height=0, unet_name=None, clip_name=None,
-                 vae_name=None, outpaint_lora=None, turbo_lora=None,
-                 lora_strength=1.0):
+    def generate(self, image=None, aspect="16:9", draft_long_side=768, prompt="",
+                 negative="", seed=0, quality=QUALITIES[0], trim=TRIMS[0],
+                 auto_prefix=True, custom_width=0, custom_height=0,
+                 unet_name=None, clip_name=None, vae_name=None,
+                 outpaint_lora=None, turbo_lora=None, lora_strength=1.0):
         import nodes as comfy_nodes
         from comfy_extras.nodes_qwen import TextEncodeQwenImage21
+
+        if image is None:
+            raise RuntimeError(
+                "[Shanggu 扩图草图] image 输入是空的：按 Ctrl+R 刷新浏览器页面"
+                "（清掉旧版节点缓存）后重新加载工作流即可。")
 
         unet_name = unet_name or _default_choice(UNETS, "qwen_image_2.1")
         clip_name = clip_name or _default_choice(CLIPS, "qwen3vl_8b")
