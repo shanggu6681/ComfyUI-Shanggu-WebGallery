@@ -20,6 +20,7 @@ outpaint LoRA 训练目标就是「灰色区补全、原图区不动」，全图
 from __future__ import annotations
 
 import os
+import re
 
 import numpy as np
 import torch
@@ -210,13 +211,17 @@ def _align32(n: int) -> int:
 
 def _target_wh(aspect: str, long_side: int, custom_w: int = 0,
                custom_h: int = 0) -> tuple[int, int]:
-    """目标画布尺寸，长边=long_side，两边对齐 32（Qwen latent 要求）。"""
+    """目标画布尺寸，长边=long_side，两边对齐 32（Qwen latent 要求）。
+
+    aspect 兼容带后缀的旧工作流值，如 ausboss 原版节点的
+    "9:16 (Portrait Widescreen)"——用正则提取 "数字:数字"，解析不到才兜底 16:9。
+    """
     if aspect == "自定义" and custom_w > 0 and custom_h > 0:
         return _align32(custom_w), _align32(custom_h)
-    try:
-        a, b = aspect.split(":")
-        ratio = float(a) / float(b)
-    except Exception:
+    m = re.search(r"(\d+)\s*:\s*(\d+)", str(aspect))
+    if m:
+        ratio = float(m.group(1)) / float(m.group(2))
+    else:
         ratio = 16.0 / 9.0
     if ratio >= 1:
         w = _align32(long_side)
