@@ -244,6 +244,13 @@ class ShangguRelayVSRUpscale:
             raise RuntimeError("[Shanggu RelayVSR] 需要 ComfyUI 0.45 及以上（RelayVSR 原生支持）。")
         from comfy_extras.nodes_wan import RelayVSRConditioning, VSRDecode
 
+        # 扩图等节点会输出 4 通道 RGBA（带透明通道），而 VSR 解码 / 人脸检测都按
+        # 3 通道处理。统一在此压成 RGB：黑底合成，alpha=1 的区域保持原样。
+        if image.dim() == 4 and int(image.shape[-1]) == 4:
+            alpha = image[..., 3:4].clamp(0.0, 1.0)
+            image = image[..., :3] * alpha
+            print("[Shanggu RelayVSR] 输入为 RGBA，已按黑底合成压成 RGB。")
+
         m = _load_model(_require("diffusion_models", model))
         v = _load_vae(_require("vae", vae))
         chunk = max(1024, int(chunk_tokens))
@@ -354,6 +361,8 @@ def _face_masks(image, stride=1):
         print(f"[Shanggu RelayVSR] detect_faces 跳过：脸模型不可用（{exc}）。{hint} 或手动接 protect_mask。")
         return None
     B, H, W = int(image.shape[0]), int(image.shape[1]), int(image.shape[2])
+    if image.dim() == 4 and int(image.shape[-1]) > 3:
+        image = image[..., :3]  # 兜底：RGBA 只取 RGB 通道（正常不应走到这里，run() 已压平）
     s = min(1.0, 640 / max(H, W))
     out = torch.zeros((B, H, W), dtype=torch.float32)
     mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
