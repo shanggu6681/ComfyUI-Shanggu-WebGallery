@@ -1,61 +1,164 @@
-// Shanggu 说明卡片 —— AusBoss 风格工作流说明卡（画布自绘，v1）
-// 卡片内容：大标题 + 正文（自动换行）+ 可选链接 + MODELS 清单（实时检查
-// 本机 models 目录里是否已安装，✅ installed / ❌ 缺少）。
+// Shanggu 说明卡片 —— AusBoss 风格工作流说明卡（DOM 版，v2）
+// 正文区改为 DOM 覆盖层（真 HTML）：
+//   - 所有文字可鼠标框选复制
+//   - 网址是可点击的 <a>（新标签页打开），也能框选复制
+//   - 节点包每项渲染成深色代码块 `git clone xxx` + 复制按钮（仿 AI 代码输出）
+//   - 模型区保留本机安装状态检测（✓ installed / ✗ 缺少）
 // 内容存 properties（纯数据），编辑走右上角铅笔 / 双击节点 / 右键菜单。
 import { app } from "../../scripts/app.js";
+import { keepDomWidgetWidthAuto } from "./shared/index.mjs";
 
-/* ---------- 风格常量（与保存图像 / 组开关 / LoRA 加载器一致） ---------- */
+/* ---------- 风格常量（画布底色与卡片边框，与保存图像 / 组开关一致） ---------- */
 const BRAND = "#0ea5a4";
-const BRAND_TEXT = "#04201d";
-const BORDER = "#3a4448";
-const OFF_TEXT = "#8ba3a1";
-const CAP_TEXT = "#617574";
-const MISSING = "#c2711d";
-const TITLE_COLOR = "#eef7f5";
-const BODY_COLOR = "#a9bcba";
-const FONT = `-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif`;
 const CARD_BG = "rgba(0,0,0,0.28)";
 const CARD_BORDER = "rgba(14,165,164,0.22)";
 
-/* ---------- 布局常量 ---------- */
-const MX = 12;              // 卡片左右内边距
-const TITLE_H = 26;
-const BYLINE_H = 16;
-const BODY_LH = 15;         // 正 文行高
-const LINK_H = 20;
-const SEC_H = 24;           // MODELS 区头
-const MODEL_H = 22;         // 每个模型行
-const PAD_BOT = 10;
+/* ---------- 一次性注入卡片内部样式 ---------- */
+(function injectStyle() {
+  if (document.getElementById("sg-note-style")) return;
+  const st = document.createElement("style");
+  st.id = "sg-note-style";
+  st.textContent = `
+.sg-note-root{width:100%;overflow:visible}
+.sg-note{box-sizing:border-box;padding:10px 12px 12px;font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#a9bcba}
+.sg-note *{box-sizing:border-box}
+.sg-note-head{display:flex;align-items:center;gap:8px;margin-bottom:2px}
+.sg-note-title{flex:1;min-width:0;font-size:15px;font-weight:700;color:#eef7f5;user-select:text;cursor:text;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sg-note-pen{flex:none;background:rgba(255,255,255,0.06);border:1px solid #3a4448;border-radius:6px;color:#8ba3a1;font:600 12px sans-serif;padding:2px 8px;cursor:pointer}
+.sg-note-pen:hover{color:#0ea5a4;border-color:rgba(14,165,164,0.6)}
+.sg-note-byline{font-size:9px;font-weight:600;letter-spacing:.08em;color:#617574;text-transform:uppercase;margin-bottom:4px;user-select:text}
+.sg-note-body{white-space:pre-wrap;word-break:break-word;font-size:11.5px;line-height:1.45;color:#a9bcba;user-select:text;cursor:text}
+.sg-note-link{margin-top:6px}
+.sg-note-link a{color:#0ea5a4;font-weight:600;font-size:11.5px;text-decoration:none;border-bottom:1px solid rgba(14,165,164,0.5);user-select:text}
+.sg-note-sec{font-size:10px;font-weight:700;color:#8ba3a1;margin:10px 0 4px;letter-spacing:.04em;user-select:text;display:flex;align-items:center}
+.sg-node-name{font-size:11.5px;font-weight:600;color:#cfe5e2;margin:6px 0 3px;user-select:text}
+.sg-code{display:flex;align-items:stretch;gap:6px;background:#0b0d0f;border:1px solid #2c3336;border-radius:6px;padding:3px 4px 3px 8px;margin-bottom:2px}
+.sg-code-text{flex:1;min-width:0;font:11px/1.7 Consolas,Menlo,monospace;color:#d7e5e2;white-space:nowrap;overflow-x:auto;user-select:text;cursor:text;scrollbar-width:thin}
+.sg-copy{flex:none;align-self:center;background:rgba(14,165,164,0.14);border:1px solid rgba(14,165,164,0.5);border-radius:5px;color:#0ea5a4;font:600 10px sans-serif;padding:2px 8px;cursor:pointer}
+.sg-copy:hover{background:rgba(14,165,164,0.28)}
+.sg-copy.done{background:rgba(14,165,164,0.4)}
+.sg-check{margin-left:auto;background:rgba(255,255,255,0.06);border:1px solid #3a4448;border-radius:5px;color:#8ba3a1;font:600 9.5px sans-serif;padding:1px 7px;cursor:pointer}
+.sg-check:hover{color:#0ea5a4}
+.sg-folder{font-size:10px;font-weight:700;color:#617574;margin:6px 0 1px;user-select:text}
+.sg-mrow{display:flex;align-items:center;gap:6px;padding:2.5px 0}
+.sg-dot{width:7px;height:7px;border-radius:50%;flex:none;background:#617574}
+.sg-dot.ok{background:#0ea5a4}
+.sg-dot.missing{background:#c2711d}
+.sg-mname{flex:none;max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#cfe5e2;user-select:text}
+.sg-murl{flex:1;min-width:0;font-size:10.5px;color:#0ea5a4;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:text}
+.sg-murl:hover{text-decoration:underline}
+.sg-mnote{flex:1;min-width:0;font-size:10px;color:#617574;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:text}
+.sg-badge{flex:none;font:600 9.5px sans-serif;border-radius:9px;padding:1.5px 8px;background:rgba(255,255,255,0.06);border:1px solid #3a4448;color:#617574}
+.sg-badge.ok{background:rgba(14,165,164,0.16);border-color:rgba(14,165,164,0.5);color:#0ea5a4}
+.sg-badge.missing{background:rgba(194,113,29,0.16);border-color:#c2711d;color:#f5b04c}
+`;
+  document.head.appendChild(st);
+})();
 
-/* 文本测量用离屏 context（computeSize 里没有 ctx） */
-const measureCtx = document.createElement("canvas").getContext("2d");
-
-function bodyFont(ctx) { ctx.font = `400 11px ${FONT}`; }
-function wrapLines(text, maxW) {
-  const out = [];
-  for (const raw of String(text || "").split("\n")) {
-    if (!raw) { out.push(""); continue; }
-    let line = "";
-    for (const word of raw.split(/(\s+)/)) {
-      const cand = line + word;
-      if (measureCtx.measureText(cand).width > maxW && line) {
-        out.push(line);
-        line = word.trimStart();
-      } else {
-        line = cand;
-      }
-    }
-    out.push(line);
-  }
-  return out;
+/* ---------- 小工具 ---------- */
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
 }
 
-/* ---------- 模型检查 ---------- */
+/* 网址识别：http(s) 开头，或 github.com/xxx 这类可补 https:// 的形式。
+   其余（如「随包发布」）按纯文本备注渲染。 */
+function toHref(u) {
+  const s = String(u || "").trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^[\w-]+(\.[\w-]+)+\//.test(s) || /^[\w-]+(\.[\w-]+)+$/.test(s)) return "https://" + s;
+  return null;
+}
+function dispUrl(u) {
+  return String(u || "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+function repoName(u) {
+  const s = String(u || "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  const seg = s.split("/").filter(Boolean);
+  return seg.length ? seg[seg.length - 1] : "";
+}
+
+/* 节点包行解析：`名称 | 地址` 或裸地址 */
+function parseNodeEntry(line) {
+  const s = String(line || "").trim();
+  if (!s) return null;
+  const i = s.indexOf("|");
+  let name = "", url = s;
+  if (i >= 0) { name = s.slice(0, i).trim(); url = s.slice(i + 1).trim(); }
+  if (!name) name = repoName(url) || url;
+  return { name, url };
+}
+
+/* 模型条目：兼容旧版纯文件名字符串；新版 {folder, name, url} */
+function normalizeModel(m) {
+  if (typeof m === "string") return { name: m.trim() };
+  if (m && typeof m === "object") {
+    return { folder: String(m.folder || "").trim(), name: String(m.name || "").trim(), url: String(m.url || "").trim() };
+  }
+  return null;
+}
+function modelNames(node) {
+  return (node.properties?.models || []).map(normalizeModel).filter(Boolean).map((m) => m.name).filter(Boolean);
+}
+/* 模型条目 ↔ 编辑框行文本：文件夹 | 文件名 | 地址（文件夹可省略） */
+function modelToLine(m) {
+  const n = normalizeModel(m) || { name: "" };
+  const parts = [];
+  if (n.folder) parts.push(n.folder);
+  parts.push(n.name);
+  if (n.url) parts.push(n.url);
+  return parts.join(" | ");
+}
+function parseModelLine(line) {
+  const parts = String(line || "").split("|").map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  if (parts.length === 1) return { name: parts[0] };
+  if (parts.length === 2) return { name: parts[0], url: parts[1] };
+  return { folder: parts[0], name: parts[1], url: parts.slice(2).join(" | ") };
+}
+
+/* ---------- 复制 ---------- */
+async function copyText(text, btn) {
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch (_e) { /* 降级 */ }
+  if (!ok) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;top:-999px;left:0;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand("copy");
+      ta.remove();
+    } catch (_e2) { /* 放弃 */ }
+  }
+  const old = btn.textContent;
+  btn.textContent = ok ? "已复制 ✓" : "复制失败";
+  btn.classList.toggle("done", ok);
+  setTimeout(() => { btn.textContent = old; btn.classList.remove("done"); }, 1200);
+}
+function copyBtn(text) {
+  const b = el("button", "sg-copy", "复制");
+  b.type = "button";
+  b.title = "点击复制";
+  b.addEventListener("click", (e) => { e.stopPropagation(); copyText(text, b); });
+  return b;
+}
+
+/* ---------- 模型安装状态检查 ---------- */
 async function checkModels(node) {
-  if (node._sgChecking) return;           // 请求进行中不重复发（每帧 draw 都会触发 ensureCheck）
+  if (node._sgChecking) return;
   node._sgChecking = true;
-  const names = node.properties?.models || [];
-  if (!names.length) { node._sgCheck = { found: {}, missing: [], checked: true }; node._sgChecking = false; return; }
+  const names = modelNames(node);
+  if (!names.length) {
+    node._sgCheck = { found: {}, missing: [], checked: true };
+    node._sgChecking = false;
+    renderNote(node);
+    return;
+  }
   try {
     const r = await fetch("/sg_gallery/check_models", {
       method: "POST",
@@ -70,152 +173,132 @@ async function checkModels(node) {
     node._sgCheck = { found: {}, missing: names.slice(), checked: false };
   }
   node._sgChecking = false;
-  node.setDirtyCanvas?.(true, true);
+  renderNote(node);
 }
-
 function ensureCheck(node) {
   if (node._sgCheck?.checked) return node._sgCheck;
   checkModels(node);
-  return { found: {}, missing: node.properties?.models || [], checked: false };
+  return { found: {}, missing: modelNames(node), checked: false };
 }
 
-/* ---------- 布局 ---------- */
-function layout(node) {
+/* ---------- DOM 渲染 ---------- */
+function renderNote(node) {
+  const inner = node._sgInner;
+  if (!inner) return;   // 不查 isConnected：addDOMWidget 挂载晚于首次调用，挂上后靠 RO 回调补测高度
   const p = node.properties || {};
-  const W = node.size[0];
-  const innerW = W - MX * 2 - 4;
-  measureCtx.font = `400 11px ${FONT}`;
-  const bodyLines = wrapLines(p.body, innerW);
-  const models = p.models || [];
-  const hasLink = !!(p.link && String(p.link).trim());
-  let H = 8 + TITLE_H + 4;
-  if (p.byline) H += BYLINE_H;
-  H += bodyLines.length * BODY_LH;
-  if (hasLink) H += LINK_H;
-  if (models.length) H += SEC_H + models.length * MODEL_H;
-  H += PAD_BOT;
-  return { W, H, p, innerW, bodyLines, models, hasLink };
-}
+  inner.textContent = "";
 
-/* ---------- 绘制 ---------- */
-function rr(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  /* 头部：标题 + 铅笔 */
+  const head = el("div", "sg-note-head");
+  head.append(el("div", "sg-note-title", p.title || "说明卡片"));
+  const pen = el("button", "sg-note-pen", "✎");
+  pen.type = "button";
+  pen.title = "编辑说明卡片";
+  pen.addEventListener("click", (e) => { e.stopPropagation(); openEditor(node); });
+  head.append(pen);
+  inner.append(head);
 
-function ellipsize(ctx, text, maxW) {
-  if (ctx.measureText(text).width <= maxW) return text;
-  let s = text;
-  while (s.length > 1 && ctx.measureText(s + "…").width > maxW) s = s.slice(0, -1);
-  return s + "…";
-}
+  if (p.byline) inner.append(el("div", "sg-note-byline", String(p.byline)));
+  if (p.body) inner.append(el("div", "sg-note-body", String(p.body)));
 
-function drawCard(ctx, node, width, baseY) {
-  const L = layout(node);
-  let y = baseY + 8;
-  const p = L.p;
-
-  /* 标题 + 铅笔 */
-  ctx.save();
-  ctx.font = `700 15px ${FONT}`;
-  ctx.fillStyle = TITLE_COLOR;
-  ctx.textAlign = "left"; ctx.textBaseline = "middle";
-  ctx.fillText(ellipsize(ctx, p.title || "说明卡片", L.innerW - 26), MX, y + TITLE_H / 2);
-  // 铅笔按钮（右上）
-  const pen = penRect(L);
-  ctx.font = `600 12px ${FONT}`;
-  ctx.fillStyle = CAP_TEXT;
-  ctx.textAlign = "center";
-  ctx.fillText("✎", pen[0] + pen[2] / 2, baseY + 8 + TITLE_H / 2 + 1);
-  y += TITLE_H + 4;
-  /* 署名 */
-  if (p.byline) {
-    ctx.font = `600 9px ${FONT}`;
-    ctx.fillStyle = CAP_TEXT;
-    ctx.textAlign = "left";
-    ctx.fillText(String(p.byline).toUpperCase(), MX, y + BYLINE_H / 2);
-    y += BYLINE_H;
+  if (p.link && String(p.link).trim()) {
+    const href = toHref(p.link);
+    const row = el("div", "sg-note-link");
+    const a = document.createElement("a");
+    a.href = href || "#";
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = "▶ " + (p.linkText || dispUrl(p.link));
+    row.append(a);
+    inner.append(row);
   }
-  /* 正文 */
-  bodyFont(ctx);
-  ctx.fillStyle = BODY_COLOR;
-  ctx.textAlign = "left";
-  for (const line of L.bodyLines) {
-    ctx.fillText(line, MX, y + BODY_LH / 2);
-    y += BODY_LH;
+
+  /* 【节点包 Nodes】：名称 + git clone 代码块 + 复制按钮 */
+  const nodes = (p.nodes || []).map(parseNodeEntry).filter(Boolean);
+  if (nodes.length) {
+    inner.append(el("div", "sg-note-sec", "【节点包 Nodes】"));
+    for (const n of nodes) {
+      inner.append(el("div", "sg-node-name", n.name));
+      if (n.url) {
+        const href = toHref(n.url);
+        const cmd = "git clone " + (href || n.url);
+        const code = el("div", "sg-code");
+        const ct = el("div", "sg-code-text", cmd);
+        code.append(ct, copyBtn(cmd));
+        inner.append(code);
+      }
+    }
   }
-  /* 链接行 */
-  if (L.hasLink) {
-    y += 4;
-    const lr = linkRect(L, y - baseY - 4);
-    ctx.font = `600 11px ${FONT}`;
-    ctx.fillStyle = BRAND;
-    ctx.textAlign = "left";
-    ctx.fillText("▶ " + (p.linkText || p.link), MX, y + 8);
-    // 下划线
-    const tw = Math.min(ctx.measureText("▶ " + (p.linkText || p.link)).width, L.innerW);
-    ctx.strokeStyle = "rgba(14,165,164,0.5)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(MX + 2, y + 15.5);
-    ctx.lineTo(MX + 2 + tw, y + 15.5);
-    ctx.stroke();
-    y += LINK_H;
-  }
-  /* MODELS 区 */
-  if (L.models.length) {
-    y += 4;
-    // 区头
-    ctx.font = `700 10px ${FONT}`;
-    ctx.fillStyle = OFF_TEXT;
-    ctx.textAlign = "left";
-    ctx.fillText("MODELS", MX, y + SEC_H / 2);
-    const chk = checkRect(L, y - baseY - 4);
-    const chkLabel = node._sgCheck?.checked ? "⟳ check files" : "✓ check files";
-    ctx.font = `600 9.5px ${FONT}`;
-    ctx.fillStyle = CAP_TEXT;
-    ctx.textAlign = "right";
-    ctx.fillText(chkLabel, chk[0] + chk[2] - 4, y + SEC_H / 2);
-    y += SEC_H;
-    // 每个模型行
+
+  /* 【必需模型 Models】：文件夹 / 模型名 / 可点击地址 + 安装状态 */
+  const models = (p.models || []).map(normalizeModel).filter((m) => m && m.name);
+  if (models.length) {
+    const sec = el("div", "sg-note-sec", "【必需模型 Models】");
+    const chk = el("button", "sg-check", node._sgCheck?.checked ? "⟳ 重新检查" : "✓ 检查安装");
+    chk.type = "button";
+    chk.title = "检查本机 models 目录是否已安装这些文件";
+    chk.addEventListener("click", (e) => { e.stopPropagation(); node._sgCheck = null; checkModels(node); });
+    sec.append(chk);
+    inner.append(sec);
+
     const check = ensureCheck(node);
-    L.models.forEach((name, i) => {
-      const ry = y + i * MODEL_H;
-      const found = Object.prototype.hasOwnProperty.call(check.found, name);
-      const ok = found && !check.missing.includes(name);
-      const pending = !check.checked;
-      // 状态点
-      ctx.beginPath();
-      ctx.arc(MX + 5, ry + MODEL_H / 2, 3.5, 0, Math.PI * 2);
-      ctx.fillStyle = pending ? "#617574" : ok ? BRAND : MISSING;
-      ctx.fill();
-      // 文件名
-      bodyFont(ctx);
-      ctx.fillStyle = ok ? "#cfe5e2" : pending ? BODY_COLOR : "#f5b04c";
-      ctx.textAlign = "left";
-      ctx.fillText(ellipsize(ctx, name, L.innerW - 96), MX + 16, ry + MODEL_H / 2);
-      // 右侧徽章
-      ctx.font = `600 9.5px ${FONT}`;
-      const label = pending ? "检查中…" : ok ? "installed ✓" : "缺少 ✗";
-      const bw = ctx.measureText(label).width + 14;
-      const bx = L.W - MX - bw;
-      rr(ctx, bx, ry + 3, bw, MODEL_H - 6, 9);
-      ctx.fillStyle = pending ? "rgba(255,255,255,0.06)"
-        : ok ? "rgba(14,165,164,0.16)" : "rgba(194,113,29,0.16)";
-      ctx.fill();
-      ctx.strokeStyle = pending ? BORDER : ok ? "rgba(14,165,164,0.5)" : MISSING;
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      ctx.fillStyle = pending ? CAP_TEXT : ok ? BRAND : "#f5b04c";
-      ctx.textAlign = "center";
-      ctx.fillText(label, bx + bw / 2, ry + MODEL_H / 2 + 1);
-    });
-    y += L.models.length * MODEL_H;
+    /* 按文件夹分组（保持输入顺序） */
+    const groups = [];
+    let cur = null, curFolder;
+    for (const m of models) {
+      const f = m.folder || "";
+      if (f !== curFolder) { curFolder = f; cur = { folder: f, items: [] }; groups.push(cur); }
+      cur.items.push(m);
+    }
+    for (const g of groups) {
+      if (g.folder) inner.append(el("div", "sg-folder", "▸ " + g.folder));
+      for (const m of g.items) {
+        const row = el("div", "sg-mrow");
+        const found = Object.prototype.hasOwnProperty.call(check.found, m.name);
+        const ok = found && !check.missing.includes(m.name);
+        const pending = !check.checked;
+        row.append(el("span", "sg-dot" + (pending ? "" : ok ? " ok" : " missing")));
+        row.append(el("span", "sg-mname", m.name));
+        const href = toHref(m.url);
+        if (href) {
+          const a = document.createElement("a");
+          a.className = "sg-murl";
+          a.href = href;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          a.textContent = dispUrl(m.url);
+          a.title = href;
+          row.append(a);
+        } else if (m.url) {
+          row.append(el("span", "sg-mnote", m.url));
+        } else {
+          row.append(el("span", "sg-mnote", ""));
+        }
+        row.append(el("span", "sg-badge" + (pending ? "" : ok ? " ok" : " missing"),
+          pending ? "检查中…" : ok ? "installed ✓" : "缺少 ✗"));
+        inner.append(row);
+      }
+    }
   }
-  ctx.restore();
+  syncNoteHeight(node);
 }
 
-/* ---------- 命中区域 ---------- */
-function penRect(L) { return [L.W - MX - 22, 8, 20, 20]; }
-function linkRect(L, relY) { return [MX - 4, relY, L.innerW + 8, LINK_H]; }
-function checkRect(L, relY) { return [L.W - MX - 90, relY, 90, SEC_H]; }
+/* ---------- 高度跟随内容（只增不减到内容高度，宽度用户拖） ---------- */
+function syncNoteHeight(node) {
+  const inner = node._sgInner;
+  if (inner && inner.isConnected) {
+    const h = inner.offsetHeight;
+    if (h > 4) node._sgDomH = h;   // 折叠/隐藏时测得 0，保留缓存值
+  }
+  try {
+    if (node.size && node._sgDomH) {
+      const base = node.widgets?.[0]?.last_y ?? 2;
+      const target = base + node._sgDomH + 8;
+      if (Math.abs(node.size[1] - target) > 1.5) node.size[1] = target;
+    }
+  } catch (_e) { /* 忽略 */ }
+  node.setDirtyCanvas?.(true, true);
+}
 
 /* ---------- 编辑弹窗 ---------- */
 function openEditor(node) {
@@ -247,23 +330,29 @@ function openEditor(node) {
     return inp;
   }
 
-  field("标题", p.title, (v) => (p.title = v));
-  field("署名（如 BY SG）", p.byline, (v) => (p.byline = v));
-  field("链接地址（可空）", p.link, (v) => (p.link = v));
-  field("链接文字（可空）", p.linkText, (v) => (p.linkText = v));
-  field("正文（自动换行，空行分段）", p.body, (v) => (p.body = v), true);
-  const modelsInp = field("模型文件（每行一个，自动检查是否已安装）", (p.models || []).join("\n"), (v) => {
-    p.models = v.split("\n").map((s) => s.trim()).filter(Boolean);
-    node._sgCheck = null;
-    ensureCheck(node);
+  field("标题", p.title, (v) => { p.title = v; renderNote(node); });
+  field("署名（如 BY SG）", p.byline, (v) => { p.byline = v; renderNote(node); });
+  field("链接地址（可空）", p.link, (v) => { p.link = v; renderNote(node); });
+  field("链接文字（可空）", p.linkText, (v) => { p.linkText = v; renderNote(node); });
+  field("正文（自动换行，空行分段）", p.body, (v) => { p.body = v; renderNote(node); }, true);
+  field("节点包（每行一个：名称 | git地址，也可只写地址）", (p.nodes || []).join("\n"), (v) => {
+    p.nodes = v.split("\n").map((s) => s.trim()).filter(Boolean);
+    renderNote(node);
   }, true);
+  field("模型文件（每行一个：文件夹 | 文件名 | 下载地址；文件夹可省略，地址可填备注文字）",
+    (p.models || []).map(modelToLine).join("\n"), (v) => {
+      p.models = v.split("\n").map(parseModelLine).filter(Boolean);
+      node._sgCheck = null;
+      renderNote(node);
+      ensureCheck(node);
+    }, true);
 
   const doneRow = document.createElement("div");
   doneRow.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px";
   const done = document.createElement("button");
   done.textContent = "完成";
   done.style.cssText = "background:#0ea5a4;color:#04201d;font-weight:600;border:none;border-radius:6px;padding:6px 18px;cursor:pointer";
-  done.onclick = () => { wrap.remove(); node.setDirtyCanvas?.(true, true); };
+  done.onclick = () => { wrap.remove(); renderNote(node); };
   doneRow.appendChild(done);
   card.appendChild(doneRow);
 
@@ -272,61 +361,38 @@ function openEditor(node) {
   document.body.appendChild(wrap);
 }
 
-/* ---------- widget 构造 ---------- */
-function makeCardWidget(node) {
-  const w = {
-    name: "sg_note_card",
-    type: "custom",
-    sgIsShanggu: true,
-    y: 0,
-    options: { serialize: false },
-    serializeValue() { return ""; },
-    computeSize() {
-      const L = layout(this.node);
-      return [0, L.H + 6];
-    },
-    draw(ctx, nodeRef, width, y) { drawCard(ctx, this.node, width, y); },
-    mouse(e, pos, nodeRef) {
-      if (e.type !== "pointerdown" && e.type !== "mousedown") return false;
-      const node = this.node;
-      const L = layout(node);
-      const x = pos[0], y0 = pos[1] - (this.last_y ?? 0);
-      // 铅笔
-      const pen = penRect(L);
-      const penAbs = [pen[0], pen[1], pen[2], pen[3]];
-      if (x >= penAbs[0] && x <= penAbs[0] + penAbs[2] && y0 >= penAbs[1] && y0 <= penAbs[1] + penAbs[3]) {
-        openEditor(node);
-        return true;
-      }
-      // 链接行
-      if (L.hasLink) {
-        let ly = 8 + TITLE_H + 4 + (L.p.byline ? BYLINE_H : 0) + L.bodyLines.length * BODY_LH + 4;
-        if (y0 >= ly && y0 <= ly + LINK_H) {
-          try { window.open(L.p.link, "_blank"); } catch (err) { /* 忽略 */ }
-          return true;
-        }
-      }
-      // check files 按钮
-      if (L.models.length) {
-        let sy = 8 + TITLE_H + 4 + (L.p.byline ? BYLINE_H : 0) + L.bodyLines.length * BODY_LH + (L.hasLink ? LINK_H : 0) + 4;
-        const chk = checkRect(L, sy);
-        if (x >= chk[0] && x <= chk[0] + chk[2] && y0 >= sy && y0 <= sy + SEC_H) {
-          node._sgCheck = null;
-          checkModels(node);
-          return true;
-        }
-      }
-      return false;
-    },
-  };
-  w.node = node;
-  return w;
-}
+/* ---------- DOM widget 挂载 ---------- */
+function attachDom(node) {
+  if (!node._sgInner) {
+    const root = document.createElement("div");
+    root.className = "sg-note-root";
+    const inner = document.createElement("div");
+    inner.className = "sg-note";
+    root.appendChild(inner);
+    node._sgRoot = root;
+    node._sgInner = inner;
 
-function rebuildWidgets(node) {
-  node.widgets = (node.widgets || []).filter((x) => !x.sgIsShanggu);
-  node.widgets.push(makeCardWidget(node));
-  node.setDirtyCanvas?.(true, true);
+    // 按钮 / 链接 / 代码块上的按下不透传给画布（避免触发节点拖拽）
+    root.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("button,a,.sg-code")) e.stopPropagation();
+    });
+
+    const dw = node.addDOMWidget("sg_note_card", "sg_note", root, {
+      serialize: false,
+      hideOnZoom: false,
+    });
+    node._sgDomWidget = dw;
+    dw.serialize = false;
+    keepDomWidgetWidthAuto(dw);
+    dw.computeSize = () => [0, (node._sgDomH || 300) + 6];
+
+    // 内容尺寸变化（改字 / 换行 / 检测结果回来）→ 节点高度跟随
+    const ro = new ResizeObserver(() => syncNoteHeight(node));
+    ro.observe(inner);
+    node._sgRo = ro;
+  }
+  // 无论首次还是二次（onConfigure 带回工作流数据后）都重渲一次
+  renderNote(node);
 }
 
 const DEFAULTS = () => ({
@@ -335,6 +401,7 @@ const DEFAULTS = () => ({
   body: "1. 先在下方选择要用的模型和 LoRA；\n2. 点提示词框编写提示词；\n3. 生成后点保存图像卡片右下角浏览历史。",
   link: "",
   linkText: "",
+  nodes: [],
   models: [],
 });
 
@@ -362,6 +429,13 @@ app.registerExtension({
       return r;
     };
 
+    // 覆盖引擎 computeSize：高度精确 = 排布起点 + DOM 内容高 + 8，
+    // 拖拽缩小时不会留下大块无效区（与纯文字卡片同策略）
+    nodeType.prototype.computeSize = function () {
+      const base = this.widgets?.[0]?.last_y ?? 2;
+      return [this.size?.[0] || 340, base + (this._sgDomH || 300) + 8];
+    };
+
     const origCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function (...args) {
       const r = origCreated?.apply(this, args);
@@ -369,9 +443,10 @@ app.registerExtension({
       for (const [k, v] of Object.entries(DEFAULTS())) {
         if (this.properties[k] === undefined) this.properties[k] = v;
       }
+      if (!Array.isArray(this.properties.nodes)) this.properties.nodes = [];
       if (!Array.isArray(this.properties.models)) this.properties.models = [];
-      if ((this.size?.[0] || 0) < 300) this.size = [300, this.size?.[1] || 180];
-      rebuildWidgets(this);
+      if ((this.size?.[0] || 0) < 340) this.size = [340, this.size?.[1] || 300];
+      attachDom(this);
       ensureCheck(this);
       return r;
     };
@@ -382,8 +457,12 @@ app.registerExtension({
       for (const [k, v] of Object.entries(DEFAULTS())) {
         if (this.properties[k] === undefined) this.properties[k] = v;
       }
-      rebuildWidgets(this);
+      if (!Array.isArray(this.properties.nodes)) this.properties.nodes = [];
+      if (!Array.isArray(this.properties.models)) this.properties.models = [];
+      attachDom(this);
       ensureCheck(this);
+      // 首帧 last_y 还没值，等一帧再校一次高度
+      setTimeout(() => syncNoteHeight(this), 60);
       return r;
     };
 
@@ -398,6 +477,14 @@ app.registerExtension({
       openEditor(this);
       return true;
     };
+
+    const origRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function (...args) {
+      try { this._sgRo?.disconnect(); } catch (_e) { /* 忽略 */ }
+      this._sgRoot = null;
+      this._sgInner = null;
+      return origRemoved?.apply(this, args);
+    };
   },
 });
 
@@ -409,6 +496,32 @@ const TXT_MX = 10;
 const TXT_LH = 15;          // 正文行高
 const TXT_PAD_TOP = 6;
 const TXT_PAD_BOT = 8;
+
+/* 文本测量用离屏 context（computeSize 里没有 ctx） */
+const measureCtx = document.createElement("canvas").getContext("2d");
+const FONT = `-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif`;
+const BODY_COLOR = "#a9bcba";
+const OFF_TEXT = "#8ba3a1";
+
+function bodyFont(ctx) { ctx.font = `400 11px ${FONT}`; }
+function wrapLines(text, maxW) {
+  const out = [];
+  for (const raw of String(text || "").split("\n")) {
+    if (!raw) { out.push(""); continue; }
+    let line = "";
+    for (const word of raw.split(/(\s+)/)) {
+      const cand = line + word;
+      if (measureCtx.measureText(cand).width > maxW && line) {
+        out.push(line);
+        line = word.trimStart();
+      } else {
+        line = cand;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
 
 function textCardLayout(node) {
   const W = node.size?.[0] || 220;
