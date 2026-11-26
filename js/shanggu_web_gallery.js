@@ -1,5 +1,5 @@
 // ComfyUI-Shanggu-WebGallery — 前端扩展
-// 面板：网址抓取 / 粘贴源码 / 浏览器桥接；滚动加载；点选即等价于 LoadImage。
+// 面板：网址抓取 / 导入图片 / 导入文件夹；滚动加载；点选即等价于 LoadImage。
 // 运行次数只由「单图 / 多图」一个开关决定：
 //   单图 → 1 张图，运行 1 次；多图 → 每张图各提交 1 个独立 prompt，运行 N 次。
 import { app } from "/scripts/app.js";
@@ -96,9 +96,11 @@ const CSS = `
 .sg-hint code{color:#7ce0dc}
 .sg-bookmark{display:inline-block;margin-top:2px;color:#7ce0dc;text-decoration:underline;cursor:grab}
 /* 「加载内容」榜单选择 */
-.sg-rank{display:flex;gap:5px;align-items:center;font-size:10.5px;flex:none}
-.sg-rank label{opacity:.75;white-space:nowrap}
-.sg-rank select{flex:1;min-width:0;font-size:10.5px;padding:2px 4px}
+.sg-rank{display:flex;gap:5px;align-items:center;font-size:10.5px;flex:1 1 320px;min-width:0}
+.sg-rank[hidden]{display:none}
+.sg-rank label{opacity:.75;white-space:nowrap;font-size:10px}
+.sg-load-options[hidden]{display:none}
+.sg-rank.sg-only{flex-basis:100%}
 /* 网站设置（右下角齿轮打开） */
 .sg-sites{flex:none;border:1px solid var(--border-color,#4a4a4a);border-radius:4px;
   padding:5px;background:rgba(0,0,0,.16);font-size:10.5px}
@@ -151,49 +153,6 @@ function el(tag, cls, text) {
   if (text !== undefined) n.textContent = text;
   return n;
 }
-
-/* 书签脚本：在你自己的浏览器页面上运行，把当前页所有图片网址复制到剪贴板 */
-function sgBridgeBookmarklet() {
-  var seen = {}, urls = [];
-  function add(u) {
-    if (!u) return;
-    try { u = new URL(u, location.href).href; } catch (e) { return; }
-    if (!/^https?:/.test(u)) return;
-    if (/\.svg(\?|$)/i.test(u)) return;
-    if (/(logo|icon|avatar|favicon|sprite|placeholder|1x1)/i.test(u)) return;
-    if (!seen[u]) { seen[u] = 1; urls.push(u); }
-  }
-  function scanImg(n) {
-    add(n.currentSrc || n.src);
-    ["data-src", "data-original", "data-lazy-src", "data-url", "data-image"].forEach(function (a) {
-      add(n.getAttribute(a));
-    });
-    var ss = n.getAttribute("srcset") || n.getAttribute("data-srcset");
-    if (ss) ss.split(",").forEach(function (p) { add(p.trim().split(/\s+/)[0]); });
-  }
-  document.querySelectorAll("img,source").forEach(scanImg);
-  document.querySelectorAll("a[href]").forEach(function (a) {
-    if (/\.(jpe?g|png|webp|gif|avif|bmp)(\?|$)/i.test(a.href)) add(a.href);
-  });
-  document.querySelectorAll('[style*="background"]').forEach(function (n) {
-    var m = /url\(["']?([^"')]+)/.exec(n.getAttribute("style") || "");
-    if (m) add(m[1]);
-  });
-  var text = urls.join("\n");
-  function fallback(t) {
-    var ta = document.createElement("textarea");
-    ta.value = t; document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); } catch (e) {}
-    ta.remove();
-    alert("已复制 " + urls.length + " 个图片网址，去 ComfyUI 节点的「粘贴源码」里 Ctrl+V");
-  }
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(function () {
-      alert("已复制 " + urls.length + " 个图片网址，去 ComfyUI 节点的「粘贴源码」里 Ctrl+V");
-    }, function () { fallback(text); });
-  } else fallback(text);
-}
-const BOOKMARKLET = "javascript:(" + sgBridgeBookmarklet.toString() + ")()";
 
 /* --------------------------------------------- 循环执行：一次 Run => N 次
  * ComfyUI 单次 prompt 是一张静态 DAG，节点本身没法「回头」重跑下游。
@@ -335,22 +294,26 @@ function buildPanel(node) {
   rowUrl.append(urlInput, btnSearch);
   const quick = el("div", "sg-quick");
   quick.appendChild(el("span", "", "快捷:"));
-  // 快捷按钮由「网站设置」里的站点列表动态生成：默认只有 civitai。
-  // 其余网站由你自己用右下角「⚙ 网站」按钮添加，列表只存本机浏览器
-  // localStorage，不写进工作流 JSON，所以不会随工作流上 GitHub。
+  // 快捷按钮来自网站设置；默认只提供 civitai 和 prompthero。
+  // 网站列表只存本机浏览器 localStorage，不写进工作流 JSON。
   const quickBtns = el("span", "sg-quick");
   quickBtns.style.display = "inline-flex";
   quick.appendChild(quickBtns);
   paneUrl.append(rowUrl, quick);
 
-  /* --- 加载内容（榜单/排序）：随当前站点的类型切换选项 --- */
+  /* --- 加载内容1（榜单/排序）与加载内容2（分类/模型）--- */
   const rankRow = el("div", "sg-rank");
-  rankRow.appendChild(el("label", "", "加载内容:"));
+  rankRow.appendChild(el("label", "", "加载内容1:"));
   const rankSel = el("select");
   rankRow.appendChild(rankSel);
-  paneUrl.appendChild(rankRow);
+  const topicRow = el("div", "sg-rank");
+  topicRow.appendChild(el("label", "", "加载内容2:"));
+  const topicSel = el("select");
+  topicRow.appendChild(topicSel);
+  const loadOptionsRow = el("div", "sg-row sg-load-options");
+  loadOptionsRow.append(rankRow, topicRow);
+  paneUrl.appendChild(loadOptionsRow);
 
-  // 各站点的榜单选项（value 直接对应后端 settings.rank）
   const RANK_OPTIONS = {
     civitai: [
       ["newest", "最新上传"], ["week", "周榜 · 最多赞"],
@@ -358,12 +321,113 @@ function buildPanel(node) {
       ["all", "总榜 · 最多赞"], ["reactions", "最多点赞(全部)"],
       ["comments", "最多评论"], ["collected", "最多收藏"],
     ],
-    aitag: [
-      ["newest", "最新作品"], ["month", "本月榜"],
-      ["month_real", "当月实时榜"], ["month_prev", "上月榜"],
-      ["month_old", "往期榜"],
+    prompthero: [
+      ["newest", "最新作品"],
+      ["favorites", "最多收藏"], ["views", "最多浏览"],
     ],
   };
+  const TOPIC_OPTIONS = {
+    civitai: [
+      ["tag:111768", "动物"], ["tag:4", "动漫"],
+      ["tag:5998", "海滩"], ["tag:5186", "卡通"],
+      ["tag:5132", "猫"], ["tag:2397", "漫画"],
+      ["tag:334", "角色扮演"], ["tag:499", "赛博朋克"],
+      ["tag:2539", "狗"], ["tag:5499", "龙"],
+      ["tag:2040", "精灵"], ["tag:5207", "奇幻"],
+      ["tag:5140", "兽人"], ["tag:6976", "女仆"],
+      ["tag:413", "日本漫画"], ["tag:482", "机甲"],
+      ["tag:5668", "怪物"], ["tag:1441", "肖像"],
+      ["tag:5248", "写实"], ["tag:6594", "机器人"],
+      ["tag:1949", "自拍"], ["tag:1776", "蒸汽朋克"],
+    ],
+    prompthero: [
+      ["cat:portraits", "分类 · 人像"],
+      ["cat:photography", "分类 · 摄影"],
+      ["cat:anime", "分类 · 动漫"],
+      ["cat:fashion", "分类 · 时尚"],
+      ["cat:concept-art", "分类 · 概念艺术"],
+      ["cat:architecture", "分类 · 建筑"],
+      ["cat:landscapes", "分类 · 风景"],
+      ["cat:logo-icon-design", "分类 · 标志 / 图标 / 设计"],
+      ["cat:interior-design", "分类 · 室内设计"],
+      ["cat:3d-renders", "分类 · 3D / 渲染"],
+      ["cat:character-design", "分类 · 角色设计"],
+      ["model:ChatGPT Image", "提供商 · GPT / ChatGPT Image"],
+      ["model:Midjourney", "提供商 · Midjourney"],
+      ["model:Stable Diffusion", "提供商 · Stable Diffusion"],
+      ["model:DALL-E", "提供商 · DALL·E"],
+      ["model:Flux", "提供商 · FLUX"],
+      ["model:Ideogram", "提供商 · Ideogram"],
+      ["model:Nano Banana", "提供商 · Nano Banana"],
+      ["model:Seedream", "提供商 · Seedream"],
+      ["model:Grok Image", "提供商 · Grok Image"],
+    ],
+  };
+  const PH_PATHS = {
+    newest: "/search", favorites: "/search", views: "/search",
+  };
+  function promptHeroRankFromUrl(value) {
+    try {
+      const u = new URL(value);
+      const sort = u.searchParams.get("sort");
+      if (sort === "favorites" || sort === "views") return sort;
+    } catch (e) {}
+    return "";
+  }
+  function promptHeroTopicFromUrl(value) {
+    try {
+      const u = new URL(value);
+      const category = u.searchParams.get("category");
+      if (category) return "cat:" + category;
+      const model = u.searchParams.get("model");
+      if (model) return "model:" + model;
+    } catch (e) {}
+    return "";
+  }
+  function applyPromptHeroRank(value) {
+    const path = PH_PATHS[value] || "/search";
+    const sort = value === "favorites" || value === "views" ? value : "";
+    try {
+      const u = new URL(urlInput.value || "https://prompthero.com/search");
+      u.pathname = path;
+      u.searchParams.delete("sort");
+      u.searchParams.delete("page");
+      if (sort) u.searchParams.set("sort", sort);
+      urlInput.value = u.toString();
+      rememberUrl(urlInput.value);
+    } catch (e) {}
+  }
+  function civitaiTopicFromUrl(value) {
+    try {
+      const u = new URL(value);
+      const tags = u.searchParams.get("tags") || u.searchParams.get("tag");
+      if (tags) return "tag:" + tags.split(",")[0];
+    } catch (e) {}
+    return "";
+  }
+  function applySiteTopic(value) {
+    try {
+      const u = new URL(urlInput.value);
+      u.searchParams.delete("page");
+      if (state.siteKind === "prompthero") {
+        u.searchParams.delete("category");
+        u.searchParams.delete("model");
+        if (value.startsWith("cat:")) u.searchParams.set("category", value.slice(4));
+        if (value.startsWith("model:")) u.searchParams.set("model", value.slice(6));
+      } else if (state.siteKind === "civitai") {
+        u.searchParams.delete("tags");
+        u.searchParams.delete("tag");
+        if (value.startsWith("tag:")) u.searchParams.set("tags", value.slice(4));
+      }
+      urlInput.value = u.toString();
+      rememberUrl(urlInput.value);
+    } catch (e) {}
+  }
+  function syncLoadOptionsRow() {
+    loadOptionsRow.hidden = rankRow.hidden && topicRow.hidden;
+    rankRow.classList.toggle("sg-only", topicRow.hidden);
+    topicRow.classList.toggle("sg-only", rankRow.hidden);
+  }
   function fillRankOptions(kind) {
     const opts = RANK_OPTIONS[kind] || [];
     rankSel.innerHTML = "";
@@ -373,9 +437,25 @@ function buildPanel(node) {
       rankSel.appendChild(o);
     });
     rankRow.hidden = opts.length === 0;
-    // 记住每个站点上次选的榜单，切来切去不丢
+    syncLoadOptionsRow();
     const saved = (state && state.rankByKind && state.rankByKind[kind]) || "";
     if (saved && opts.some((x) => x[0] === saved)) rankSel.value = saved;
+  }
+  function fillTopicOptions(kind) {
+    const opts = TOPIC_OPTIONS[kind] || [];
+    topicSel.innerHTML = "";
+    const all = el("option", "", kind === "prompthero" ? "全部（不限分类 / 提供商）" : "全部（不限内容分类）");
+    all.value = "";
+    topicSel.appendChild(all);
+    opts.forEach(([v, t]) => {
+      const o = el("option", "", t);
+      o.value = v;
+      topicSel.appendChild(o);
+    });
+    topicRow.hidden = opts.length === 0;
+    syncLoadOptionsRow();
+    const saved = (state && state.topicByKind && state.topicByKind[kind]) || "";
+    if (saved && opts.some((x) => x[0] === saved)) topicSel.value = saved;
   }
 
   /* --- 网站设置（右下角齿轮打开） --- */
@@ -538,14 +618,15 @@ function buildPanel(node) {
     ["page_template", "分页模板", "静态站翻页用，如 ?page={page}；JSON API 一般留空自动用 nextPage"],
     ["url_regex", "URL 正则", "可选。特殊站点自定义提取规则，第一个捕获组是图片地址"],
     ["per_page", "每页上限", "200"],
-    ["safe_only", "内容过滤", "yes"],
+    ["content_filter", "内容过滤", "sfw"],
   ];
   defs.forEach(([k, label, ph]) => {
     advGrid.appendChild(el("label", "", label));
     let inp;
-    if (k === "safe_only") {
+    if (k === "content_filter") {
       inp = el("select");
-      inp.innerHTML = '<option value="yes">跳过标记为 NSFW 的图</option><option value="no">不过滤</option>';
+      inp.innerHTML = '<option value="sfw">不显示 NSFW</option><option value="all">全显示</option><option value="nsfw">仅有 NSFW</option>';
+      inp.title = "Civitai / PromptHero 按站点标记过滤；其他网站只能识别响应中明确提供的 NSFW 标记";
       inp.dataset.kind = "select";
     } else {
       inp = el("input");
@@ -592,8 +673,9 @@ function buildPanel(node) {
     override: null,      // 循环执行期间临时写入 prompt 的单张 JSON
     runTotal: 0,
     runDone: 0,
-    rankByKind: {},      // 每个站点上次选的榜单，切换站点时保留
-    siteKind: "",        // 当前网址识别出的站点类型（civitai / aitag / 空）
+    rankByKind: {},      // 每个站点上次选的加载内容，切换站点时保留
+    topicByKind: {},
+    siteKind: "",        // civitai / prompthero / 空
   };
   // 用 Set 去重：解除上限后可能上万条，数组的 some() 会退化成 O(n²)
   state.seenUrls = new Set(state.items.map((x) => x && x.url).filter(Boolean));
@@ -602,10 +684,11 @@ function buildPanel(node) {
   function collectSettings() {
     const s = {};
     Object.entries(fields).forEach(([k, inp]) => { s[k] = inp.value; });
-    s.safe_only = fields.safe_only.value === "yes";
-    // 没有 18+ 按钮：固定开启。aitag.win 输入即 show_r18=1，其他站点忽略此参数。
+    s.content_filter = fields.content_filter.value;
+    s.safe_only = s.content_filter === "sfw";
     s.r18 = true;
-    s.rank = rankSel.value || "newest";   // 「加载内容」榜单选择
+    s.rank = rankSel.value || "newest";
+    s.topic = topicSel.value || "";
     try { s.per_page = Math.max(1, Math.min(400, parseInt(s.per_page || "200", 10))); }
     catch (e) { s.per_page = 200; }
     node.properties.sg_settings = s;
@@ -615,50 +698,83 @@ function buildPanel(node) {
   function restoreSettings() {
     const s = node.properties.sg_settings || {};
     Object.entries(fields).forEach(([k, inp]) => {
-      if (s[k] !== undefined && s[k] !== null) {
-        inp.value = k === "safe_only" ? (s[k] === false ? "no" : "yes") : String(s[k]);
+      if (k === "content_filter") {
+        const saved = ["sfw", "all", "nsfw"].includes(s.content_filter) ? s.content_filter : "";
+        inp.value = saved || (s.safe_only === false ? "all" : "sfw");
+      } else if (s[k] !== undefined && s[k] !== null) {
+        inp.value = String(s[k]);
       }
     });
   }
 
-  /* --------------------------------------------------------------- 网站管理
-   * 站点列表只存浏览器 localStorage，不镜像进 node.properties ——
-   * 你自己添加的网站不会写进工作流 JSON，所以不会随工作流上 GitHub。
-   * 代码里不预置任何第三方网站，默认只有 civitai 一个站点。
-   * 每个站点：{ name(简短名), url, kind(可选：civitai/其他，决定榜单选项) }
-   */
-  const SITES_KEY = "sg_gallery_sites_v1";
+  const SITES_KEY = "sg_gallery_sites_v3";
+  const PINNED_SITES = [
+    { name: "prompthero", url: "https://prompthero.com/search", kind: "prompthero", pinned: true },
+  ];
   const DEFAULT_SITES = [
-    { name: "civitai", url: "https://civitai.red/images", kind: "civitai" },
+    { name: "civitai", url: "https://civitai.com/images", kind: "civitai" },
+    ...PINNED_SITES,
   ];
   let sites = [];
   function loadSites() {
     let arr = null;
     try { arr = JSON.parse(localStorage.getItem(SITES_KEY) || "null"); } catch (e) {}
+    if (!Array.isArray(arr)) {
+      try { arr = JSON.parse(localStorage.getItem("sg_gallery_sites_v2") || "null"); } catch (e) {}
+      if (Array.isArray(arr)) {
+        arr = arr.filter((x) => x && {
+          civitai: 1, prompthero: 1,
+        }[kindOfUrl(x.url)]);
+      }
+    }
     if (!Array.isArray(arr) || !arr.length) arr = DEFAULT_SITES;
-    sites = arr.filter((x) => x && x.url).map((x) => ({
-      name: String(x.name || "网站").slice(0, 24),
-      url: String(x.url || ""),
-      kind: String(x.kind || ""),
-    }));
+    sites = arr.filter((x) => x && /^https?:\/\//i.test(x.url))
+      .map((x) => {
+        const url = String(x.url);
+        return {
+          name: String(x.name || "网站").slice(0, 24), url,
+          kind: kindOfUrl(url), pinned: false,
+        };
+      });
+    for (const p of PINNED_SITES) {
+      if (!sites.some((s) => s.kind === p.kind)) sites.unshift({ ...p });
+    }
+    sites.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+    saveSites();
   }
   function saveSites() {
     // 只写 localStorage：绝不写 node.properties，网站列表不进工作流
     try { localStorage.setItem(SITES_KEY, JSON.stringify(sites)); } catch (e) {}
   }
   function kindOfUrl(u) {
-    const s = String(u || "").toLowerCase();
-    if (s.indexOf("civitai") >= 0) return "civitai";
-    if (s.indexOf("aitag.win") >= 0) return "aitag";
+    try {
+      const host = new URL(u).hostname.toLowerCase().replace(/^www\./, "");
+      if (host === "civitai.com" || host === "civitai.red") return "civitai";
+      if (host === "prompthero.com") return "prompthero";
+    } catch (e) {}
     return "";
   }
   function detectSiteKind() {
     const k = kindOfUrl(urlInput.value);
-    if (k === state.siteKind && rankSel.options.length) return;
+    if (k === state.siteKind && rankSel.options.length && k !== "prompthero") return;
     state.siteKind = k;
     const savedRank = state.rankByKind[k] || "";
+    const savedTopic = state.topicByKind[k] || "";
     fillRankOptions(k);
-    if (savedRank) rankSel.value = savedRank;
+    fillTopicOptions(k);
+    if (k === "prompthero") {
+      const urlRank = promptHeroRankFromUrl(urlInput.value);
+      if (urlRank && rankSel.querySelector('option[value="' + urlRank + '"]')) rankSel.value = urlRank;
+      else if (savedRank) rankSel.value = savedRank;
+      const urlTopic = promptHeroTopicFromUrl(urlInput.value);
+      if (urlTopic && topicSel.querySelector('option[value="' + urlTopic + '"]')) topicSel.value = urlTopic;
+      else if (savedTopic) topicSel.value = savedTopic;
+    } else {
+      const urlTopic = civitaiTopicFromUrl(urlInput.value);
+      if (urlTopic && topicSel.querySelector('option[value="' + urlTopic + '"]')) topicSel.value = urlTopic;
+      else if (savedTopic) topicSel.value = savedTopic;
+      if (savedRank) rankSel.value = savedRank;
+    }
   }
   function renderQuickButtons() {
     quickBtns.innerHTML = "";
@@ -669,6 +785,10 @@ function buildPanel(node) {
         urlInput.value = site.url;
         rememberUrl(site.url);
         detectSiteKind();
+        if (state.siteKind === "prompthero") {
+          applyPromptHeroRank(rankSel.value);
+          applySiteTopic(topicSel.value);
+        }
         doFetch(true);
       };
       quickBtns.appendChild(b);
@@ -689,13 +809,14 @@ function buildPanel(node) {
         const nm = nameInp.value.trim() || ("网站" + (idx + 1));
         const uu = urlInp.value.trim();
         if (!/^https?:\/\//i.test(uu)) { sitesMsg.textContent = "网址需以 http:// 或 https:// 开头"; return; }
-        sites[idx] = { name: nm, url: uu, kind: site.kind || kindOfUrl(uu) };
+        sites[idx] = { name: nm, url: uu, kind: kindOfUrl(uu) };
         saveSites(); renderQuickButtons(); renderSitesList();
         sitesMsg.textContent = "已保存 " + nm + "（只存本机浏览器）";
       };
       const btnDel = el("button", "sg-del", "×");
-      btnDel.title = "删除这个网站";
+      btnDel.title = site.pinned ? "内置站点，不能删除" : "删除这个网站";
       btnDel.onclick = () => {
+        if (site.pinned) { sitesMsg.textContent = "PromptHero 是内置快捷站点，不能删除（网址可改）"; return; }
         sites.splice(idx, 1);
         saveSites(); renderQuickButtons(); renderSitesList();
         sitesMsg.textContent = "已删除";
@@ -721,7 +842,13 @@ function buildPanel(node) {
   btnSitesClose.onclick = () => { sitesBox.hidden = true; };
   rankSel.onchange = () => {
     state.rankByKind[state.siteKind] = rankSel.value;
-    // 只改「加载内容」方式时，用当前网址重新搜索（后端会按新 rank 构造接口）
+    if (state.siteKind === "prompthero") applyPromptHeroRank(rankSel.value);
+    rememberUrl(urlInput.value.trim());
+    doFetch(true);
+  };
+  topicSel.onchange = () => {
+    state.topicByKind[state.siteKind] = topicSel.value;
+    applySiteTopic(topicSel.value);
     rememberUrl(urlInput.value.trim());
     doFetch(true);
   };
@@ -1062,6 +1189,7 @@ function buildPanel(node) {
         state.page = r.page || 0;
         if (r.message && !(r.items || []).length) setStatus(r.message, false);
         else updateStatus();
+        state.autoChained = 0;
       }
     } catch (e) {
       setStatus("请求失败: " + e, true);
@@ -1070,10 +1198,12 @@ function buildPanel(node) {
       state.loading = false;
       btnMore.disabled = false;
     }
-    // 这一页没能撑长滚动条时，浏览器不会再发 scroll 事件，无限滚动就
-    // 卡死在底部了（整页被去重 / 接口偶发空页都会这样）。主动再拉几页。
-    // 手动点「加载更多」= 只加一页；自动续拉只服务滚动，别一口气再拖 12 页
-    if (!reset && !ignoreLimit && state.hasMore && !state.truncated && nearGridBottom()) {
+    // 搜索页不足一屏或没有新图时，浏览器不会发滚动事件，需主动续拉。
+    // 先检查下一页的上限，避免抓取后才被截断。
+    if (
+      (!reset || grid.scrollHeight > 0) && state.hasMore && !state.truncated &&
+      (nearGridBottom() || grid.scrollHeight <= grid.clientHeight)
+    ) {
       state.autoChained += 1;
       if (state.autoChained <= 12) setTimeout(() => doFetch(false), 80);
     } else {
@@ -1083,8 +1213,15 @@ function buildPanel(node) {
 
   grid.addEventListener("scroll", () => {
     state.autoChained = 0;         // 用户真的滚动了，续拉计数重新开始
-    if (nearGridBottom()) doFetch(false);
+    if (!state.loading && state.hasMore && !state.truncated && nearGridBottom()) {
+      doFetch(false);
+    }
+  }, { passive: true });
+  const gridObserver = new ResizeObserver(() => {
+    state.autoChained = 0;
+    if (nearGridBottom() || grid.scrollHeight <= grid.clientHeight) doFetch(false);
   });
+  gridObserver.observe(grid);
 
   function rememberUrl(value) {
     const ww = w("site_url");
@@ -1166,13 +1303,19 @@ function buildPanel(node) {
     // 站点列表 + 快捷按钮 + 榜单联动（站点只从 localStorage 读，不进工作流）
     loadSites();
     renderQuickButtons();
-    const savedRank = (node.properties.sg_settings || {}).rank;
-    if (savedRank) state.rankByKind[kindOfUrl(urlInput.value)] = savedRank;
-    state.siteKind = "";          // 强制 detectSiteKind 重建选项
-    detectSiteKind();
-    if (savedRank && rankSel.querySelector('option[value="' + savedRank + '"]')) {
-      rankSel.value = savedRank;
+    const savedSettings = node.properties.sg_settings || {};
+    const restoredKind = kindOfUrl(urlInput.value);
+    const savedRank = String(savedSettings.rank || "");
+    const savedTopic = String(savedSettings.topic || "");
+    if (restoredKind === "prompthero" && savedRank.startsWith("cat:")) {
+      state.topicByKind.prompthero = savedRank;
+      state.rankByKind.prompthero = "newest";
+    } else {
+      if (savedRank) state.rankByKind[restoredKind] = savedRank;
+      if (savedTopic) state.topicByKind[restoredKind] = savedTopic;
     }
+    state.siteKind = "";
+    detectSiteKind();
     if (node.properties.sg_select_mode) {
       const sm = w("select_mode");
       if (sm) sm.value = node.properties.sg_select_mode;

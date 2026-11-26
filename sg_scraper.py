@@ -32,8 +32,7 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".jxl", "
 # 防盗链：这些 CDN 只认来源站的 Referer，用图片域名自己当 Referer 会 403。
 # (域名后缀, 应该带的 Referer)，子域名自动匹配。
 REFERER_RULES = (
-    ("pximg.net", "https://www.pixiv.net/"),
-    ("ai-img.10118899.xyz", "https://aitag.win/"),
+    ("img.prompthero.com", "https://prompthero.com/"),
 )
 
 BAD_TOKENS = (
@@ -166,6 +165,10 @@ def _is_nsfw(obj: dict) -> bool:
     for k in ("nsfwLevel", "browsingLevel", "rating"):
         v = obj.get(k)
         if isinstance(v, (int, float)) and v >= 8:
+            return True
+        if isinstance(v, str) and v.strip().lower() in (
+            "soft", "mature", "x", "explicit", "nsfw", "adult", "r18"
+        ):
             return True
     return False
 
@@ -312,7 +315,7 @@ def next_page_url(data: Any, base: str, current: str, page_template: str, page: 
     if tpl and ("{page}" in tpl or "{offset}" in tpl):
         return render_page_template(tpl, base or current, page)
     # 常见的 {page, page_size, total, items} 分页结构，接口不给 nextPage 时
-    # 也能靠 page+1 继续滚动（aitag.win / 大量 REST 图库都是这个形状）。
+    # 也能靠 page+1 继续滚动（大量 REST 图库都是这个形状）。
     if isinstance(data, dict) and isinstance(data.get("items"), list) and data["items"]:
         try:
             pg, ps, total = (int(data.get("page") or 0),

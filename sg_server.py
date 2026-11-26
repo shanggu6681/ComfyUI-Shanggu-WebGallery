@@ -50,20 +50,31 @@ def get_session(sid: str, reset: bool = False) -> dict:
 def _clean_settings(raw: Any) -> dict:
     if not isinstance(raw, dict):
         return {}
-    keys = ("cookie", "ua", "referer", "proxy", "url_regex", "page_template", "safe_only", "per_page")
+    keys = ("cookie", "ua", "referer", "proxy", "url_regex", "page_template", "safe_only", "per_page",
+            "content_filter", "rank", "topic")
     out = {k: raw.get(k, "") for k in keys}
-    out["safe_only"] = raw.get("safe_only", True) is not False
-    # 18+ 固定开启（前端已无开关）：aitag.win 的主要内容就在 show_r18=1 里
+    mode = str(raw.get("content_filter") or "").strip().lower()
+    if mode not in ("sfw", "all", "nsfw"):
+        mode = "sfw" if raw.get("safe_only", True) is not False else "all"
+    out["content_filter"] = mode
+    out["safe_only"] = mode == "sfw"
+    # 保留旧工作流里的 r18 字段；Civitai 榜单由 rank 控制。
     rv = raw.get("r18", True)
     out["r18"] = rv is not False and str(rv).lower() not in ("false", "0", "no", "off", "")
-    # 榜单/排序方式：civitai 用 sort+period，aitag.win 用 /api/rank/... 路径。
-    # 值来自前端「加载内容」里的下拉框，默认 newest（站点默认流）。
     out["rank"] = str(raw.get("rank") or "newest").strip().lower()
+    out["topic"] = str(raw.get("topic") or "").strip()
     try:
         out["per_page"] = max(1, min(400, int(raw.get("per_page") or 200)))
     except Exception:
         out["per_page"] = 200
     return out
+
+
+def _filter_content(items: list[dict], mode: str) -> list[dict]:
+    if mode == "all":
+        return items
+    want_nsfw = mode == "nsfw"
+    return [it for it in items if bool(it.get("nsfw")) == want_nsfw]
 
 
 def _new_items(s: dict, items: list[dict]) -> list[dict]:
@@ -78,34 +89,46 @@ def _new_items(s: dict, items: list[dict]) -> list[dict]:
     return out
 
 
-def rewrite_gallery_url(url: str, r18: bool = True, rank: str = "newest") -> tuple[str, bool]:
+def rewrite_gallery_url(
+    url: str,
+    r18: bool = True,
+    rank: str = "newest",
+    topic: str = "",
+    content_filter: str = "sfw",
+) -> tuple[str, bool]:
     """网页版图库被 Cloudflare 挡住 / 是 SPA 时，自动改用同站的官方 JSON 接口。
 
     返回值第二个元素只表示「网页地址被换成接口」，用于前端提示；
-    18+ / 榜单参数的同步不算改写，但仍会返回调整后的地址。
-
-    rank（前端「加载内容」下拉）：
-      civitai  -> newest / week / month / year / all / reactions / comments / collected
-      aitag    -> newest / month / month_prev / month_old / ...（见 adapters.rank_to_api）
+    18+ / 榜单 / 分类参数的同步不算改写，但仍会返回调整后的地址。
     """
     try:
         p = urllib.parse.urlsplit(url)
         host = (p.netloc or "").lower().split(":")[0]
         path = (p.path or "").rstrip("/")
         if host.startswith(("civitai.", "www.civitai.")):
-            # 已经是接口地址：把榜单参数同步进去（18+ 由调用方在 settings 里带）
             if path.startswith("/api/v1/images"):
-                return _civitai_rank_url(f"https://{p.netloc}{p.path}", rank, p.query), False
+                return _civitai_rank_url(
+                    f"https://{p.netloc}{p.path}", rank, p.query, topic, content_filter
+                ), False
             if path in ("", "/images", "/models"):
-                return _civitai_rank_url(f"https://{p.netloc}/api/v1/images", rank, ""), True
+                return _civitai_rank_url(
+                    f"https://{p.netloc}/api/v1/images", rank, "", topic, content_filter
+                ), True
     except Exception:
         pass
-    # SPA 图库（HTML 里没有图片，全靠 JS 调自家 JSON 接口）
-    extra, hit = adapters.rewrite_extra(url, r18, rank)
+    extra, hit = adapters.rewrite_extra(
+        url, r18, rank, topic=topic, content_filter=content_filter
+    )
     return extra or url, bool(hit)
 
 
-def _civitai_rank_url(api_base: str, rank: str, old_query: str = "") -> str:
+def _civitai_rank_url(
+    api_base: str,
+    rank: str,
+    old_query: str = "",
+    topic: str = "",
+    content_filter: str = "sfw",
+) -> str:
     """给 civitai /api/v1/images 加上 sort + period，得到不同榜单。
 
     实测该接口支持：
@@ -117,6 +140,11 @@ def _civitai_rank_url(api_base: str, rank: str, old_query: str = "") -> str:
     params.setdefault("limit", "20")
     params.pop("sort", None)
     params.pop("period", None)
+    params.pop("tags", None)
+    params.pop("tag", None)
+    if str(topic or "").startswith("tag:"):
+        params["tags"] = str(topic)[4:]
+    params["nsfw"] = "true" if content_filter != "sfw" else "false"
     table = {
         "newest":     ("Newest", None),
         "reactions":  ("Most Reactions", "AllTime"),
@@ -165,9 +193,10 @@ def _settings_for(url: str, base: dict, sid: str = "") -> dict:
 
 
 def _error(msg: str, **extra) -> web.Response:
+    headers = extra.pop("headers", None)
     body = {"ok": False, "error": msg, "items": [], "has_more": False}
     body.update(extra)
-    return web.json_response(body)
+    return web.json_response(body, headers=headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,17 +211,20 @@ async def handle_fetch(request: web.Request) -> web.Response:
     reset = bool(d.get("reset", True))
     url = str(d.get("url") or "").strip()
     settings = _clean_settings(d.get("settings"))
-    # aitag.win 固定 18+：前端已移除 18+ 开关，只要网址是它，就强制 show_r18=1。
-    # 这样老工作流里残留的 r18=false 也不会把成人内容过滤掉。
-    if "aitag.win" in url.lower():
-        settings["r18"] = True
+    # PromptHero 对浏览器 UA 返回 Cloudflare 挑战，curl UA 可直接取得页面。
+    if "prompthero.com" in url.lower() and not settings.get("ua"):
+        settings["ua"] = "curl/8.0"
     s = get_session(sid, reset)
     s["settings"] = settings
 
     rewritten = False
     if reset:
         url, rewritten = rewrite_gallery_url(
-            url, bool(settings.get("r18", True)), str(settings.get("rank") or "newest")
+            url,
+            bool(settings.get("r18", True)),
+            str(settings.get("rank") or "newest"),
+            topic=str(settings.get("topic") or ""),
+            content_filter=str(settings.get("content_filter") or "sfw"),
         )
         s["base"] = url
         s["next"] = None
@@ -218,9 +250,9 @@ async def handle_fetch(request: web.Request) -> web.Response:
     if status >= 400:
         hint = ""
         if status in (401, 403):
-            hint = (" —— 站点可能启用了 Cloudflare / 需要登录。"
-                    "可尝试：① 换成该站的 JSON API 地址（如 https://civitai.red/api/v1/images?limit=20）；"
-                    "② 在高级设置里填浏览器 Cookie 和相同 UA；③ 用「粘贴源码」或「浏览器桥接」标签页。")
+                hint = (" —— 站点可能启用了 Cloudflare / 需要登录。"
+                        "可尝试：① 换成该站的 JSON API 地址；"
+                        "② 在高级设置里填浏览器 Cookie 和相同 UA；③ 配置代理。")
         return _error(f"HTTP {status}{hint}", status=status)
 
     text = body.decode("utf-8", errors="replace")
@@ -232,7 +264,7 @@ async def handle_fetch(request: web.Request) -> web.Response:
             items, nxt, kind = sg.extract(
                 text, ctype, final,
                 url_regex=settings.get("url_regex", ""),
-                safe_only=settings["safe_only"],
+                safe_only=False,
                 page_template=settings.get("page_template", ""),
                 page=next_page_no,
                 current_url=final,
@@ -241,6 +273,7 @@ async def handle_fetch(request: web.Request) -> web.Response:
     except Exception as e:
         return _error(f"解析失败: {e}")
 
+    items = _filter_content(items, settings["content_filter"])
     new = _new_items(s, items)
     if nxt and nxt != target:
         s["next"] = nxt
@@ -305,11 +338,12 @@ async def handle_parse(request: web.Request) -> web.Response:
         items, _nxt, kind = sg.extract(
             raw, "text/plain", s["base"],
             url_regex=settings.get("url_regex", ""),
-            safe_only=settings["safe_only"],
+            safe_only=False,
             limit=settings["per_page"],
         )
     except Exception as e:
         return _error(f"解析失败: {e}")
+    items = _filter_content(items, settings["content_filter"])
     new = _new_items(s, items)
     return web.json_response({
         "ok": True, "items": new, "has_more": False,
